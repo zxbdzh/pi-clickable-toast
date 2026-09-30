@@ -138,7 +138,10 @@ export async function focusOrigin(
 ): Promise<FocusResult> {
   let herdrError: string | undefined;
   if (origin.herdrPaneId) {
-    // 先前置宿主终端（ConPTY 窗口能把 WT 切到 herdr tab），再切 Herdr 内部焦点
+    // 先前置宿主终端（ConPTY owner 即 WT 主窗口，能把窗口提到前台），
+    // 再切 Herdr 内部焦点并标记已看。宿主可能是隐藏的 detached TUI：
+    // 此时 owner 前置后用户看到的仍不是 herdr，因此再开一个新 tab attach
+    // 兜底，保证点击后 herdr TUI 一定可见。
     if (!origin.hwnd) {
       try {
         origin.hwnd = await captureHerdrHostHandle(run);
@@ -162,6 +165,19 @@ export async function focusOrigin(
       return { ok: true, method: "herdr" };
     } catch (error) {
       herdrError = error instanceof Error ? error.message : String(error);
+    }
+    // herdr agent focus 成功不保证 TUI 可见（detached TUI 或 tab 不在当前窗口）。
+    // 新开一个 tab attach 常驻 session，确保用户一定能看到 herdr。
+    try {
+      await run("cmd.exe", ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"], {
+        timeout: 5_000,
+        windowsHide: false,
+        encoding: "utf8",
+      });
+      return { ok: true, method: "herdr" };
+    } catch (error) {
+      const attachError = error instanceof Error ? error.message : String(error);
+      return { ok: false, error: [herdrError, attachError].filter(Boolean).join("; ") };
     }
   }
 

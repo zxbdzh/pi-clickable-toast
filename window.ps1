@@ -20,10 +20,22 @@ public static class PiClickableToastAttach {
 }
 '@
   Add-Type -TypeDefinition $attachCs
+  # 沿父链爬升：pi → 中间 shell → herdr.exe → herdr TUI 的 pwsh。
+  # 只有 TUI 宿主 pwsh 的 ConPTY 才是要前置的窗口；逐个尝试 AttachConsole，
+  # 第一个返回非零 GetConsoleWindow 的祖先即命中。
   $null = [PiClickableToastAttach]::FreeConsole()
-  $ok = [PiClickableToastAttach]::AttachConsole([uint32]$Value)
-  if (-not $ok) { exit 2 }
-  $h = [PiClickableToastAttach]::GetConsoleWindow()
+  $id = [int]$Value
+  $h = [IntPtr]::Zero
+  for ($depth = 0; $depth -lt 12 -and $id -gt 0; $depth++) {
+    if ([PiClickableToastAttach]::AttachConsole([uint32]$id)) {
+      $h = [PiClickableToastAttach]::GetConsoleWindow()
+      $null = [PiClickableToastAttach]::FreeConsole()
+      if ($h -ne [IntPtr]::Zero) { break }
+    }
+    $wmi = Get-CimInstance Win32_Process -Filter "ProcessId = $id" -ErrorAction SilentlyContinue
+    if (-not $wmi) { break }
+    $id = [int]$wmi.ParentProcessId
+  }
   if ($h -eq [IntPtr]::Zero) { exit 2 }
   Write-Output ([int64]$h)
   exit 0

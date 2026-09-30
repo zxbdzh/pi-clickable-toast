@@ -60,19 +60,19 @@ test("falls back to the captured terminal window if Herdr focus fails", async ()
   const run: ExecFileLike = async (file, args) => {
     calls.push({ file, args });
     if (file === "herdr.exe") throw new Error("pane unavailable");
+    // attach 兜底（cmd start）后返回 ok
+    if (file === "cmd.exe") return { stdout: "", stderr: "" };
     return { stdout: "", stderr: "" };
   };
   const origin: Origin = { cwd: "C:/work/demo", project: "demo", herdrPaneId: "w4:p12", hwnd: "1234" };
 
   const result = await focusOrigin(origin, run);
   assert.equal(result.ok, true);
-  assert.equal(result.method, "window");
-  assert.equal(result.degraded, true);
-  // 前置尝试 + herdr 失败后的兜底前置
-  assert.equal(calls[0].file, "powershell.exe");
-  assert.equal(calls[1].file, "herdr.exe");
-  assert.equal(calls[2].file, "powershell.exe");
-  assert.deepEqual(calls[2].args.slice(-4), ["-Action", "focus", "-Value", "1234"]);
+  assert.equal(result.method, "herdr"); // attach 兑底成功即视为 herdr 路径成功
+  assert.equal(calls[0].file, "powershell.exe"); // 前置尝试
+  assert.equal(calls[1].file, "herdr.exe"); // agent focus（失败）
+  assert.equal(calls[2].file, "cmd.exe"); // attach 兑底
+  assert.deepEqual(calls[2].args, ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"]);
 });
 
 test("captures a numeric ancestor window handle", async () => {
