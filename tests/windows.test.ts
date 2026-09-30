@@ -42,12 +42,17 @@ test("focuses the exact Herdr pane with stable arguments", async () => {
   const calls: Array<{ file: string; args: readonly string[] }> = [];
   const run: ExecFileLike = async (file, args) => {
     calls.push({ file, args });
+    // 首次是前置宿主窗口（ConPTY hwnd 已在 origin 上），随后 herdr focus
+    if (file === "powershell.exe") return { stdout: "", stderr: "" };
     return { stdout: "", stderr: "" };
   };
   const origin: Origin = { cwd: "C:/work/demo", project: "demo", herdrPaneId: "w4:p12", hwnd: "99" };
 
   assert.deepEqual(await focusOrigin(origin, run), { ok: true, method: "herdr" });
-  assert.deepEqual(calls, [{ file: "herdr.exe", args: ["agent", "focus", "w4:p12"] }]);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].file, "powershell.exe");
+  assert.deepEqual(calls[0].args.slice(-4), ["-Action", "focus", "-Value", "99"]);
+  assert.deepEqual(calls[1], { file: "herdr.exe", args: ["agent", "focus", "w4:p12"] });
 });
 
 test("falls back to the captured terminal window if Herdr focus fails", async () => {
@@ -63,8 +68,11 @@ test("falls back to the captured terminal window if Herdr focus fails", async ()
   assert.equal(result.ok, true);
   assert.equal(result.method, "window");
   assert.equal(result.degraded, true);
-  assert.equal(calls[1].file, "powershell.exe");
-  assert.deepEqual(calls[1].args.slice(-4), ["-Action", "focus", "-Value", "1234"]);
+  // 前置尝试 + herdr 失败后的兜底前置
+  assert.equal(calls[0].file, "powershell.exe");
+  assert.equal(calls[1].file, "herdr.exe");
+  assert.equal(calls[2].file, "powershell.exe");
+  assert.deepEqual(calls[2].args.slice(-4), ["-Action", "focus", "-Value", "1234"]);
 });
 
 test("captures a numeric ancestor window handle", async () => {

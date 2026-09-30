@@ -68,6 +68,38 @@ export async function captureTerminalWindowHandle(
   return undefined;
 }
 
+/**
+ * 解析 herdr TUI 宿主的可聚焦窗口句柄。
+ *
+ * herdr TUI 跑在 pwsh 里，没有顶层窗口，但它的 ConPTY 子窗口
+ * （class=PseudoConsoleWindow）可以被 SetForegroundWindow 前置，
+ * 效果是把宿主终端切到 herdr 所在 tab。探索顺序：
+ * 1. 从 HERDR_TUI_PID 环境变量读（由用户或 herdr 集成注入）
+ * 2. 沿当前进程链向上找（herdr 里直接跑 pi 的场景）
+ */
+export async function captureHerdrHostHandle(
+  run: ExecFileLike = systemExecFile,
+): Promise<string | undefined> {
+  const explicit = process.env.HERDR_TUI_PID;
+  const candidates = explicit && /^\d+$/.test(explicit)
+    ? [Number(explicit)]
+    : [process.pid, process.ppid].filter((value) => value > 0);
+  for (const candidate of candidates) {
+    try {
+      const { stdout } = await run(
+        POWERSHELL,
+        [...POWERSHELL_ARGS, "-Action", "console", "-Value", numeric(candidate)],
+        { timeout: 5_000, windowsHide: true, encoding: "utf8" },
+      );
+      const value = stdout.trim();
+      if (/^\d+$/.test(value) && value !== "0") return value;
+    } catch {
+      // AttachConsole fails for dead/non-console pids; try next candidate.
+    }
+  }
+  return undefined;
+}
+
 export async function isWindowForeground(
   hwnd: string | undefined,
   run: ExecFileLike = systemExecFile,
@@ -106,6 +138,21 @@ export async function focusOrigin(
 ): Promise<FocusResult> {
   let herdrError: string | undefined;
   if (origin.herdrPaneId) {
+    // 先前置宿主终端（ConPTY 窗口能把 WT 切到 herdr tab），再切 Herdr 内部焦点
+    if (!origin.hwnd) {
+      try {
+        origin.hwnd = await captureHerdrHostHandle(run);
+      } catch {
+        // fall through to herdr-only focus
+      }
+    }
+    if (origin.hwnd) {
+      try {
+        await focusWindow(origin.hwnd, run);
+      } catch {
+        // Host window focus is best-effort; herdr focus still marks seen.
+      }
+    }
     try {
       await run("herdr.exe", ["agent", "focus", origin.herdrPaneId], {
         timeout: 5_000,

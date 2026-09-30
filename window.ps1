@@ -1,10 +1,32 @@
-param(
+﻿param(
   [string]$Action,
   [Int64]$Value
 )
 
-if ($Action -notin @("capture", "focus", "foreground") -or $Value -lt 1) {
+if ($Action -notin @("capture", "focus", "foreground", "console") -or $Value -lt 1) {
   exit 1
+}
+
+if ($Action -eq "console") {
+  # AttachConsole 会改变调用者的 console，且 FreeConsole 后 stdout 失效：
+  # 独立类、先输出、后 FreeConsole。
+$attachCs = @'
+using System;
+using System.Runtime.InteropServices;
+public static class PiClickableToastAttach {
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+}
+'@
+  Add-Type -TypeDefinition $attachCs
+  $null = [PiClickableToastAttach]::FreeConsole()
+  $ok = [PiClickableToastAttach]::AttachConsole([uint32]$Value)
+  if (-not $ok) { exit 2 }
+  $h = [PiClickableToastAttach]::GetConsoleWindow()
+  if ($h -eq [IntPtr]::Zero) { exit 2 }
+  Write-Output ([int64]$h)
+  exit 0
 }
 
 if ($Action -eq "capture") {
