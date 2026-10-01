@@ -68,38 +68,6 @@ export async function captureTerminalWindowHandle(
   return undefined;
 }
 
-/**
- * 解析 herdr TUI 宿主的可聚焦窗口句柄。
- *
- * herdr TUI 跑在 pwsh 里，没有顶层窗口，但它的 ConPTY 子窗口
- * （class=PseudoConsoleWindow）可以被 SetForegroundWindow 前置，
- * 效果是把宿主终端切到 herdr 所在 tab。探索顺序：
- * 1. 从 HERDR_TUI_PID 环境变量读（由用户或 herdr 集成注入）
- * 2. 沿当前进程链向上找（herdr 里直接跑 pi 的场景）
- */
-export async function captureHerdrHostHandle(
-  run: ExecFileLike = systemExecFile,
-): Promise<string | undefined> {
-  const explicit = process.env.HERDR_TUI_PID;
-  const candidates = explicit && /^\d+$/.test(explicit)
-    ? [Number(explicit)]
-    : [process.pid, process.ppid].filter((value) => value > 0);
-  for (const candidate of candidates) {
-    try {
-      const { stdout } = await run(
-        POWERSHELL,
-        [...POWERSHELL_ARGS, "-Action", "console", "-Value", numeric(candidate)],
-        { timeout: 5_000, windowsHide: true, encoding: "utf8" },
-      );
-      const value = stdout.trim();
-      if (/^\d+$/.test(value) && value !== "0") return value;
-    } catch {
-      // AttachConsole fails for dead/non-console pids; try next candidate.
-    }
-  }
-  return undefined;
-}
-
 export async function isWindowForeground(
   hwnd: string | undefined,
   run: ExecFileLike = systemExecFile,
@@ -133,20 +101,6 @@ export interface FocusResult {
   error?: string;
 }
 
-/** ConPTY 顶层窗口通常 invisible；只有它所属 tab 被显示时才 visible。 */
-async function isHwndVisible(hwnd: string, run: ExecFileLike): Promise<boolean> {
-  try {
-    const { stdout } = await run(
-      POWERSHELL,
-      [...POWERSHELL_ARGS, "-Action", "visible", "-Value", hwnd],
-      { timeout: 5_000, windowsHide: true, encoding: "utf8" },
-    );
-    return stdout.trim() === "True";
-  } catch {
-    return false;
-  }
-}
-
 export type SpawnDetachedLike = (file: string, args: readonly string[]) => void;
 
 /**
@@ -175,25 +129,18 @@ export async function focusOrigin(
 ): Promise<FocusResult> {
   let herdrError: string | undefined;
   if (origin.herdrPaneId) {
-    // 先前置宿主终端，再切 Herdr 内部焦点并标记已看。
-    // ConPTY 顶层窗口通常 invisible；只有它所属 tab 被显示时才 visible。
-    // herdr agent focus 成功不代表用户看得到（detached TUI / tab 未聚焦），
-    // 因此 ConPTY 不可见时追加新 tab attach 兜底，保证 herdr TUI 一定出现在屏幕上。
-    if (!origin.hwnd) {
-      try {
-        origin.hwnd = await captureHerdrHostHandle(run);
-      } catch {
-        // fall through to herdr-only focus
-      }
-    }
-    let herdrVisible = false;
-    if (origin.hwnd) {
-      try {
-        await focusWindow(origin.hwnd, run);
-        herdrVisible = await isHwndVisible(origin.hwnd, run);
-      } catch {
-        // Host window focus is best-effort; herdr focus still marks seen.
-      }
+    // Herdr 界面是独立的客户端进程，不在 pi 的父进程链上，所以由脚本直接查找它所在的
+    // Windows Terminal 窗口（必要时切到对应 tab）并前置，再切 Herdr 内部焦点并标记已看。
+    let hostFocused = false;
+    try {
+      const { stdout } = await run(
+        POWERSHELL,
+        [...POWERSHELL_ARGS, "-Action", "herdr-focus", "-Value", "1"],
+        { timeout: 10_000, windowsHide: true, encoding: "utf8" },
+      );
+      hostFocused = /^[0-9]+$/.test(stdout.trim());
+    } catch {
+      // 找不到界面客户端（Herdr 在后台运行、没有任何终端显示它）→ 走 attach 兜底
     }
     try {
       await run("herdr.exe", ["agent", "focus", origin.herdrPaneId], {
@@ -204,10 +151,10 @@ export async function focusOrigin(
     } catch (error) {
       herdrError = error instanceof Error ? error.message : String(error);
     }
-    if (herdrError === undefined && herdrVisible) {
+    if (hostFocused && herdrError === undefined) {
       return { ok: true, method: "herdr" };
     }
-    // 不可见或 focus 失败：新开 tab attach 常驻 session（WT 会前台新 tab 并显示 TUI）。
+    // 没有可前置的界面窗口或 focus 失败：新开窗口 attach 常驻 session。
     // ponytail: 必须用 spawn detached 而非 execFile —— start 打开的 cmd /k 是常驻进程，
     // execFile 等它退出会永远阻塞（5s 超时后报错，点击看起来就是“没反应”）。
     try {

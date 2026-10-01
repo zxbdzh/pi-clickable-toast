@@ -3,42 +3,8 @@
   [Int64]$Value
 )
 
-if ($Action -notin @("capture", "focus", "foreground", "console", "visible") -or $Value -lt 1) {
+if ($Action -notin @("capture", "focus", "foreground", "herdr-focus") -or $Value -lt 1) {
   exit 1
-}
-
-if ($Action -eq "console") {
-  # AttachConsole 会改变调用者的 console，且 FreeConsole 后 stdout 失效：
-  # 独立类、先输出、后 FreeConsole。
-$attachCs = @'
-using System;
-using System.Runtime.InteropServices;
-public static class PiClickableToastAttach {
-  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
-  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint pid);
-  [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
-}
-'@
-  Add-Type -TypeDefinition $attachCs
-  # 沿父链爬升：pi → 中间 shell → herdr.exe → herdr TUI 的 pwsh。
-  # 只有 TUI 宿主 pwsh 的 ConPTY 才是要前置的窗口；逐个尝试 AttachConsole，
-  # 第一个返回非零 GetConsoleWindow 的祖先即命中。
-  $null = [PiClickableToastAttach]::FreeConsole()
-  $id = [int]$Value
-  $h = [IntPtr]::Zero
-  for ($depth = 0; $depth -lt 12 -and $id -gt 0; $depth++) {
-    if ([PiClickableToastAttach]::AttachConsole([uint32]$id)) {
-      $h = [PiClickableToastAttach]::GetConsoleWindow()
-      $null = [PiClickableToastAttach]::FreeConsole()
-      if ($h -ne [IntPtr]::Zero) { break }
-    }
-    $wmi = Get-CimInstance Win32_Process -Filter "ProcessId = $id" -ErrorAction SilentlyContinue
-    if (-not $wmi) { break }
-    $id = [int]$wmi.ParentProcessId
-  }
-  if ($h -eq [IntPtr]::Zero) { exit 2 }
-  Write-Output ([int64]$h)
-  exit 0
 }
 
 if ($Action -eq "capture") {
@@ -61,10 +27,16 @@ if ($Action -eq "capture") {
   exit 2
 }
 
-Add-Type @'
+Add-Type -TypeDefinition @'
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
-public static class PiClickableToastWin32v2 {
+public static class PiToastWin32 {
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern uint GetConsoleTitleW(StringBuilder title, uint size);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
@@ -75,20 +47,72 @@ public static class PiClickableToastWin32v2 {
 }
 '@
 
+# 把顶层窗口提到前台；失败返回 $false
+function Focus-Window([IntPtr]$h) {
+  if ([PiToastWin32]::IsIconic($h)) {
+    [void][PiToastWin32]::ShowWindowAsync($h, 9)
+  }
+  [uint32]$ownerPid = 0
+  [void][PiToastWin32]::GetWindowThreadProcessId($h, [ref]$ownerPid)
+  if ($ownerPid -gt 0) {
+    try { [void](New-Object -ComObject WScript.Shell).AppActivate([int]$ownerPid) } catch {}
+  }
+  [void][PiToastWin32]::BringWindowToTop($h)
+  $ok = [PiToastWin32]::SetForegroundWindow($h)
+  return ($ok -or [PiToastWin32]::GetForegroundWindow() -eq $h)
+}
+
+if ($Action -eq "herdr-focus") {
+  # Herdr 界面是独立的客户端进程（不带子命令的 herdr.exe），不在 pi 的父进程链上，
+  # 所以要直接找它：取它所在 shell 的 ConPTY，其 owner 就是承载的 Windows Terminal 窗口。
+  Add-Type -AssemblyName UIAutomationClient
+  Add-Type -AssemblyName UIAutomationTypes
+  $clients = @(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'" |
+    Where-Object { $_.CommandLine -match '^"?[^"]*herdr\.exe"?\s*$' })
+  foreach ($client in $clients) {
+    $null = [PiToastWin32]::FreeConsole()
+    if (-not [PiToastWin32]::AttachConsole([uint32]$client.ProcessId)) { continue }
+    $con = [PiToastWin32]::GetConsoleWindow()
+    $title = New-Object System.Text.StringBuilder 512
+    [void][PiToastWin32]::GetConsoleTitleW($title, 512)
+    $null = [PiToastWin32]::FreeConsole()
+    if ($con -eq [IntPtr]::Zero) { continue }
+    $owner = [PiToastWin32]::GetWindow($con, 4)
+    if ($owner -eq [IntPtr]::Zero) { continue }
+
+    # ConPTY 只有所在 tab 处于选中状态时才可见；不可见说明 Herdr 在别的 tab，按标题切过去
+    if (-not [PiToastWin32]::IsWindowVisible($con)) {
+      try {
+        $ae = [System.Windows.Automation.AutomationElement]
+        $root = $ae::FromHandle($owner)
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+          $ae::ControlTypeProperty, [System.Windows.Automation.ControlType]::TabItem)
+        foreach ($tab in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)) {
+          if ($tab.Current.Name -eq $title.ToString()) {
+            $pattern = $null
+            if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
+              $pattern.Select()
+            }
+            break
+          }
+        }
+      } catch {}
+    }
+
+    if (Focus-Window $owner) {
+      Write-Output ([int64]$owner)
+      exit 0
+    }
+    exit 3
+  }
+  exit 2
+}
+
 $hwnd = [IntPtr]$Value
 if ($hwnd -eq [IntPtr]::Zero) { exit 2 }
 
-if ($Action -eq "visible") {
-  if ([PiClickableToastWin32v2]::IsWindowVisible($hwnd)) {
-    Write-Output "True"
-  } else {
-    Write-Output "False"
-  }
-  exit 0
-}
-
 if ($Action -eq "foreground") {
-  if ([PiClickableToastWin32v2]::GetForegroundWindow() -eq $hwnd) {
+  if ([PiToastWin32]::GetForegroundWindow() -eq $hwnd) {
     Write-Output "True"
   } else {
     Write-Output "False"
@@ -96,16 +120,5 @@ if ($Action -eq "foreground") {
   exit 0
 }
 
-if ([PiClickableToastWin32v2]::IsIconic($hwnd)) {
-  [void][PiClickableToastWin32v2]::ShowWindowAsync($hwnd, 9)
-}
-
-[uint32]$ownerPid = 0
-[void][PiClickableToastWin32v2]::GetWindowThreadProcessId($hwnd, [ref]$ownerPid)
-if ($ownerPid -gt 0) {
-  try { [void](New-Object -ComObject WScript.Shell).AppActivate([int]$ownerPid) } catch {}
-}
-[void][PiClickableToastWin32v2]::BringWindowToTop($hwnd)
-$focused = [PiClickableToastWin32v2]::SetForegroundWindow($hwnd)
-if ($focused -or [PiClickableToastWin32v2]::GetForegroundWindow() -eq $hwnd) { exit 0 }
+if (Focus-Window $hwnd) { exit 0 }
 exit 3
