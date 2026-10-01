@@ -6,6 +6,7 @@ import {
   buildEventNotification,
   createOrigin,
   manualRequestUsesNative,
+  normalizeClickableConfig,
   normalizeNotifyConfig,
   shouldSilenceNative,
   sourceLine,
@@ -65,15 +66,40 @@ test("builds known event text without importing notify internals", () => {
   );
 });
 
-test("adds a compact Herdr or Windows Terminal source line", () => {
+test("source line shows only the project name, never pane or terminal session ids", () => {
   const herdr = createOrigin("C:/work/demo", {
     HERDR_ENV: "1",
     HERDR_PANE_ID: "w1:p9",
     WT_SESSION: "{12345678-abcd}",
   });
-  assert.equal(sourceLine(herdr), "demo · pane w1:p9");
-  assert.equal(appendSource("Done", herdr), "Done\n\ndemo · pane w1:p9");
+  // pane id 仍然保留在 origin 上用于聚焦，只是不再显示给用户
+  assert.equal(herdr.herdrPaneId, "w1:p9");
+  assert.equal(sourceLine(herdr), "demo");
+  assert.equal(appendSource("Done", herdr), "Done\n\ndemo");
+  assert.equal(sourceLine(createOrigin("C:/work/api", {})), "api");
+});
 
-  const terminal = createOrigin("C:/work/api", { WT_SESSION: "{12345678-abcd}" });
-  assert.equal(sourceLine(terminal), "api · WT 12345678");
+test("clickable config defaults: no source line, project icon on, app name Pi, built-in icon", () => {
+  assert.deepEqual(normalizeClickableConfig({}), {
+    enabled: true,
+    debug: false,
+    showSource: false,
+    projectIcon: true,
+    appName: "Pi",
+  });
+  assert.deepEqual(normalizeClickableConfig(null), normalizeClickableConfig({}));
+
+  assert.deepEqual(
+    normalizeClickableConfig({
+      enabled: false,
+      debug: true,
+      showSource: true,
+      projectIcon: false,
+      appName: " My Agent ",
+      icon: " D:/i.png ",
+    }),
+    { enabled: false, debug: true, showSource: true, projectIcon: false, appName: "My Agent", icon: "D:/i.png" },
+  );
+  // 空白字符串不能覆盖默认值
+  assert.deepEqual(normalizeClickableConfig({ appName: "  ", icon: "" }), normalizeClickableConfig({}));
 });

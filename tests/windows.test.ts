@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import type { Origin } from "../core.ts";
+import { projectIconSpec, type Origin } from "../core.ts";
 import {
   ToastController,
   buildNativeHelper,
   captureTerminalWindowHandle,
+  ensureProjectIcon,
   focusOrigin,
   helperCommand,
   parseHerdrFocusOutput,
+  registerToastApp,
   withoutHerdrEnv,
   type ExecFileLike,
   type NotifierLike,
@@ -68,6 +72,96 @@ test("strips HERDR_* so a spawned attach is not treated as nested herdr", () => 
     USERPROFILE: "C:/Users/1",
   });
   assert.deepEqual(env, { PATH: "C:/bin", USERPROFILE: "C:/Users/1" });
+});
+
+test("derives a stable icon spec from the project name", () => {
+  assert.deepEqual(projectIconSpec("Huajingflow"), { letter: "H", color: "2F4B93" });
+  assert.equal(projectIconSpec("andornot-schedule").letter, "AS");
+  assert.equal(projectIconSpec("pi_clickable_toast").letter, "PC");
+  assert.equal(projectIconSpec("中文项目").letter, "中");
+  assert.equal(projectIconSpec("1").letter, "1");
+
+  // 同名不同大小写、不同分隔符要去同一个颜色（否则同一项目会得到不同图标）
+  assert.equal(projectIconSpec("Huajingflow").color, projectIconSpec("huajingflow").color);
+  assert.equal(projectIconSpec("pi-clickable-toast").color, projectIconSpec("pi_clickable_toast").color);
+  // 不同项目不应该都撞到同一个颜色
+  const colors = new Set(["Huajingflow", "huajingweb", "Siftmark", "Chronos", "voxrail"].map((n) => projectIconSpec(n).color));
+  assert.ok(colors.size >= 4, `too many colour collisions: ${[...colors].join(",")}`);
+  // 颜色必须是 6 位大写十六进制，C# 端按十六进制解析
+  for (const name of ["Huajingflow", "中文项目", "1"]) assert.match(projectIconSpec(name).color, /^[0-9A-F]{6}$/);
+});
+
+test("generates the project icon once and reuses it when it already exists", async () => {
+  const dir = join(tmpdir(), "pi-clickable-toast-test-icons", String(process.pid));
+  const calls: Array<{ file: string; args: readonly string[] }> = [];
+  let onDisk = false;
+  const exists = () => onDisk;
+  const run: ExecFileLike = async (file, args) => {
+    calls.push({ file, args });
+    onDisk = true; // 辅助程序跑完就写好了文件
+    return { stdout: "", stderr: "" };
+  };
+  const deps = { run, exists, helper: async () => "X:/fake/PiToastFocus.exe", dir };
+
+  const path = await ensureProjectIcon("andornot-schedule", deps);
+  assert.ok(path && path.endsWith(".png"));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "X:/fake/PiToastFocus.exe");
+  assert.deepEqual(calls[0].args.slice(0, 6), ["-Action", "icon", "-Text", "AS", "-Color", projectIconSpec("andornot-schedule").color]);
+  assert.equal(calls[0].args.at(-2), "-Out");
+
+  // 文件已存在就不再调用辅助程序（每个项目首次之后都走这条路径）
+  assert.equal(await ensureProjectIcon("andornot-schedule", deps), path);
+  assert.equal(calls.length, 1);
+});
+
+test("falls back to the built-in icon when the helper cannot draw", async () => {
+  const deps = {
+    run: async () => { throw new Error("exe missing"); },
+    exists: () => false,
+    helper: async () => "X:/fake/PiToastFocus.exe",
+    dir: join(tmpdir(), "pi-clickable-toast-test-icons", "fail"),
+  };
+  assert.equal(await ensureProjectIcon("demo", deps), undefined);
+  assert.equal(await ensureProjectIcon("demo", { ...deps, helper: async () => undefined }), undefined);
+});
+
+test("passes the app identity and icon through to the toast", () => {
+  const sent: Array<Record<string, unknown>> = [];
+  const client: NotifierLike = { notify(options) { sent.push(options); } };
+  const controller = new ToastController("toast-1", () => {}, () => {}, client);
+
+  controller.show("t", "m", { appID: "Pi.ClickableToast", icon: "C:/icons/pi.png" });
+  controller.show("t2", "m2");
+
+  assert.equal(sent[0].appID, "Pi.ClickableToast");
+  assert.equal(sent[0].icon, "C:/icons/pi.png");
+  // 不传外观时不能带空字段（空 appID 会让 SnoreToast 报错）
+  assert.equal("appID" in sent[1], false);
+  assert.equal("icon" in sent[1], false);
+});
+
+test("registers the app identity under HKCU with name and icon, without admin rights", async () => {
+  const calls: Array<{ file: string; args: readonly string[] }> = [];
+  const run: ExecFileLike = async (file, args) => { calls.push({ file, args }); return { stdout: "", stderr: "" }; };
+
+  const ok = await registerToastApp({ id: "Pi.ClickableToast", name: "Pi", icon: "C:\\x\\icon.png" }, run);
+
+  assert.equal(ok, true);
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(call.file, "reg.exe");
+    assert.equal(call.args[1], "HKCU\\Software\\Classes\\AppUserModelId\\Pi.ClickableToast");
+    assert.ok(call.args.includes("/f"));
+  }
+  const byName = new Map(calls.map((c) => [c.args[3], c.args[7]]));
+  assert.equal(byName.get("DisplayName"), "Pi");
+  assert.equal(byName.get("IconUri"), "C:\\x\\icon.png");
+});
+
+test("reports failure instead of throwing so callers can fall back to the default identity", async () => {
+  const run: ExecFileLike = async () => { throw new Error("access denied"); };
+  assert.equal(await registerToastApp({ id: "Pi.ClickableToast", name: "Pi", icon: "C:\\x.png" }, run), false);
 });
 
 test("reports every toast callback (including timedout) to onEvent", async () => {

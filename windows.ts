@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import notifier from "node-notifier";
-import type { Origin } from "./core.ts";
+import { projectIconSpec, type Origin } from "./core.ts";
 
 export interface NotifierLike {
   notify(
@@ -100,6 +100,7 @@ export function buildNativeHelper(): Promise<boolean> {
           "-optimize+",
           "-target:exe",
           `-out:${tmp}`,
+          `-r:${join(framework, "System.Drawing.dll")}`,
           `-r:${join(wpf, "UIAutomationClient.dll")}`,
           `-r:${join(wpf, "UIAutomationTypes.dll")}`,
           `-r:${join(wpf, "WindowsBase.dll")}`,
@@ -294,6 +295,99 @@ function activated(response: unknown, metadata: unknown): boolean {
   return direct === "activate" || direct === "click" || meta === "activate" || meta === "click";
 }
 
+/** ensureProjectIcon 的可注入依赖，单测用它们避免真正编译/绘制。 */
+export interface IconDeps {
+  run?: ExecFileLike;
+  exists?: (path: string) => boolean;
+  /** 返回原生辅助程序 exe 的路径（必要时先编译），不可用时返回 undefined。 */
+  helper?: () => Promise<string | undefined>;
+  dir?: string;
+}
+
+const iconInFlight = new Map<string, Promise<string | undefined>>();
+
+/**
+ * 按项目名生成 toast 大图（首字母 + 固定颜色），写到 %TEMP% 下并缓存。文件名只由文字和颜色决定，
+ * 所以不同项目如果算出同样的结果会共用一个文件。原生辅助程序不可用或绘制失败时返回 undefined，
+ * 调用方回退到自带图标。
+ */
+export function ensureProjectIcon(project: string, deps: IconDeps = {}): Promise<string | undefined> {
+  const spec = projectIconSpec(project);
+  const dir = deps.dir ?? join(tmpdir(), "pi-clickable-toast", "icons");
+  const codePoints = Array.from(spec.letter).map((ch) => ch.codePointAt(0)?.toString(16)).join("-");
+  const target = join(dir, `${codePoints}-${spec.color}.png`);
+  const exists = deps.exists ?? existsSync;
+  if (exists(target)) return Promise.resolve(target);
+
+  const key = `${target}`;
+  const pending = iconInFlight.get(key);
+  if (pending) return pending;
+  const job = (async () => {
+    try {
+      const exe = await (deps.helper ?? (async () => ((await buildNativeHelper()) ? nativeHelperPath() : undefined)))();
+      if (!exe) return undefined;
+      mkdirSync(dir, { recursive: true });
+      await (deps.run ?? systemExecFile)(
+        exe,
+        ["-Action", "icon", "-Text", spec.letter, "-Color", spec.color, "-Out", target],
+        { timeout: 10_000, windowsHide: true },
+      );
+      return exists(target) ? target : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      iconInFlight.delete(key);
+    }
+  })();
+  iconInFlight.set(key, job);
+  return job;
+}
+
+export interface ToastAppearance {
+  /** Windows 应用标识（AUMID），决定 toast 左上角的应用名和小图标。 */
+  appID?: string;
+  /** toast 正文左侧的大图。 */
+  icon?: string;
+}
+
+/** 扩展自带的默认图标。 */
+export const DEFAULT_ICON = fileURLToPath(new URL("./assets/icon.png", import.meta.url));
+
+/** 我们自己的应用标识，避免继续用 SnoreToast 的默认身份（名字就是 SnoreToast）。 */
+export const TOAST_APP_ID = "Pi.ClickableToast";
+
+export interface ToastApp {
+  id: string;
+  name: string;
+  icon: string;
+}
+
+/**
+ * 在当前用户的注册表里登记应用标识（HKCU，不需要管理员权限）。Windows 按它查 toast 左上角的
+ * 名字和图标，不再需要开始菜单快捷方式。返回 false 时调用方必须回退到默认身份，
+ * 否则用了没登记的标识 toast 会直接不显示。
+ */
+export async function registerToastApp(app: ToastApp, run: ExecFileLike = systemExecFile): Promise<boolean> {
+  const key = `HKCU\\Software\\Classes\\AppUserModelId\\${app.id}`;
+  const values: Array<[string, string]> = [
+    ["DisplayName", app.name],
+    ["IconUri", app.icon],
+  ];
+  try {
+    await Promise.all(
+      values.map(([name, data]) =>
+        run("reg.exe", ["add", key, "/v", name, "/t", "REG_SZ", "/d", data, "/f"], {
+          timeout: 5_000,
+          windowsHide: true,
+        }),
+      ),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export class ToastController {
   private generation = 0;
   private closed = false;
@@ -317,7 +411,7 @@ export class ToastController {
     this.onEvent = onEvent;
   }
 
-  show(title: string, message: string, appID?: string): void {
+  show(title: string, message: string, appearance: ToastAppearance = {}): void {
     if (this.closed) return;
     const generation = ++this.generation;
     this.client.notify(
@@ -325,7 +419,8 @@ export class ToastController {
         title,
         message,
         id: this.id,
-        ...(appID ? { appID } : {}),
+        ...(appearance.appID ? { appID: appearance.appID } : {}),
+        ...(appearance.icon ? { icon: appearance.icon } : {}),
       },
       (error, response, metadata) => {
         if (this.closed || generation !== this.generation) return;

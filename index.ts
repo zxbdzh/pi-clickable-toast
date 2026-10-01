@@ -4,9 +4,9 @@ import type {
   ToolCallEvent,
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
   KNOWN_EVENTS,
   appendSource,
@@ -14,19 +14,26 @@ import {
   buildEventNotification,
   createOrigin,
   manualRequestUsesNative,
+  normalizeClickableConfig,
   normalizeNotifyConfig,
   shouldSilenceNative,
+  type ClickableConfig,
   type KnownEvent,
   type NotifyConfig,
   type Origin,
   type Platform,
 } from "./core.ts";
 import {
+  DEFAULT_ICON,
+  TOAST_APP_ID,
   ToastController,
   buildNativeHelper,
   captureTerminalWindowHandle,
+  ensureProjectIcon,
   focusOrigin,
   isWindowForeground,
+  registerToastApp,
+  type ToastAppearance,
 } from "./windows.ts";
 
 const CLICKABLE_CONFIG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.json");
@@ -43,11 +50,6 @@ const BUS_EVENTS: ReadonlyArray<[string, KnownEvent]> = [
 ];
 const SHARED_TASK_REGISTRY = Symbol.for("unipi.background-tasks.shared-registry");
 
-interface ClickableConfig {
-  enabled: boolean;
-  debug: boolean;
-}
-
 interface ManualNotification {
   title: string;
   message: string;
@@ -61,12 +63,18 @@ function parseJson(path: string): unknown {
 }
 
 function loadClickableConfig(): ClickableConfig {
-  const value = parseJson(CLICKABLE_CONFIG_PATH) as { enabled?: unknown; debug?: unknown };
-  return { enabled: value.enabled !== false, debug: value.debug === true };
+  return normalizeClickableConfig(parseJson(CLICKABLE_CONFIG_PATH));
+}
+
+/** 自定义图标路径相对 ~/.pi/agent 解析；文件不存在就回退到自带图标，避免 toast 因图片缺失而不显示。 */
+function resolveIcon(configured: string | undefined): { path: string; missing?: string } {
+  if (!configured) return { path: DEFAULT_ICON };
+  const path = isAbsolute(configured) ? configured : resolve(join(homedir(), ".pi", "agent"), configured);
+  return existsSync(path) ? { path } : { path: DEFAULT_ICON, missing: path };
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-01-native-helper";
+const BUILD_TAG = "2026-10-01-project-icon";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -157,6 +165,37 @@ export default function clickableToast(pi: ExtensionAPI): void {
     }
   };
 
+  // 应用标识按“名字 + 图标”懒登记：改了配置下一条 toast 就生效，不需要 /reload。
+  let appRegistration: { key: string; done: Promise<boolean> } | undefined;
+
+  const resolveAppearance = async (
+    clickable: ClickableConfig,
+    notify: NotifyConfig,
+  ): Promise<ToastAppearance> => {
+    // 自定义图标优先；否则可选按项目名生成；都不可用时用自带图标
+    const custom = resolveIcon(clickable.icon);
+    if (custom.missing) reportOnce("icon", `icon not found, using the project icon: ${custom.missing}`);
+    let icon = clickable.icon ? custom.path : DEFAULT_ICON;
+    if (!clickable.icon && clickable.projectIcon && origin) {
+      const generated = await ensureProjectIcon(origin.project);
+      if (generated) icon = generated;
+    }
+
+    // notify 配置里显式指定了 windowsAppId 就按用户的来，不由我们登记。
+    // 应用标识只含名字（不含图标路径）：图标每次生成后是同路径的，没必要让注册失效。
+    if (notify.native.windowsAppId) return { appID: notify.native.windowsAppId, icon };
+    const key = clickable.appName;
+    if (appRegistration?.key !== key) {
+      appRegistration = {
+        key,
+        done: registerToastApp({ id: TOAST_APP_ID, name: clickable.appName, icon: DEFAULT_ICON }),
+      };
+    }
+    const registered = await appRegistration.done;
+    if (!registered) reportOnce("app-id", "could not register the toast app identity; using the default one");
+    return { ...(registered ? { appID: TOAST_APP_ID } : {}), icon };
+  };
+
   const showNative = async (
     eventKey: string,
     title: string,
@@ -167,8 +206,10 @@ export default function clickableToast(pi: ExtensionAPI): void {
     if (!origin || !controller) return false;
     if (!force && shouldSilenceNative(notify, eventKey, lastInputAt)) return false;
     if (!force && notify.native.suppressWhenFocused && await isWindowForeground(origin.hwnd)) return false;
-    debugLog(`show: event=${eventKey} title=${JSON.stringify(title)}`);
-    controller.show(title, appendSource(message, origin), notify.native.windowsAppId);
+    const clickable = readConfig()?.clickable;
+    const appearance = clickable ? await resolveAppearance(clickable, notify) : {};
+    debugLog(`show: event=${eventKey} title=${JSON.stringify(title)} appID=${appearance.appID ?? "default"} icon=${appearance.icon ?? "-"}`);
+    controller.show(title, clickable?.showSource ? appendSource(message, origin) : message, appearance);
     return true;
   };
 

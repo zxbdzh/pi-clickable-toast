@@ -10,12 +10,19 @@
 //   foreground <hwnd> print True/False: is the window already in the foreground
 //   herdr-focus 1     raise the Windows Terminal window hosting the Herdr UI and select its tab
 //                     (stdout: "<hwnd> via=<method> tab=<state>", exit 2: no herdr UI window)
+//   icon              draw a rounded-square project icon: -Text <1-2 chars> -Color <RRGGBB> -Out <png path>
 //
 // Must stay C# 5 compatible: it is compiled with the in-box .NET Framework csc.exe.
 
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.Globalization;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -69,14 +76,30 @@ internal static class Program
 
     private static int Main(string[] args)
     {
-        string action = null;
-        long value = 0;
+        // every "-Name value" pair, so actions can take more than the single numeric -Value
+        Dictionary<string, string> opts = new Dictionary<string, string>();
         for (int i = 0; i < args.Length - 1; i++)
         {
-            if (args[i] == "-Action") action = args[i + 1];
-            else if (args[i] == "-Value") long.TryParse(args[i + 1], out value);
+            if (args[i].StartsWith("-")) opts[args[i].Substring(1)] = args[i + 1];
         }
-        if (action == null || value < 1) return 1;
+        string action;
+        opts.TryGetValue("Action", out action);
+        if (action == null) return 1;
+
+        if (action == "icon")
+        {
+            string text, color, outPath;
+            opts.TryGetValue("Text", out text);
+            opts.TryGetValue("Color", out color);
+            opts.TryGetValue("Out", out outPath);
+            try { return MakeIcon(text, color, outPath); }
+            catch (Exception ex) { Console.Error.WriteLine("error: " + ex.Message); return 4; }
+        }
+
+        long value = 0;
+        string rawValue;
+        if (opts.TryGetValue("Value", out rawValue)) long.TryParse(rawValue, out value);
+        if (value < 1) return 1;
 
         // Redirected stdout/stderr are plain pipe handles, so they survive FreeConsole/AttachConsole.
         try
@@ -100,6 +123,50 @@ internal static class Program
             Console.Error.WriteLine("error: " + ex.Message);
             return 4;
         }
+    }
+
+    // ---- icon: per-project avatar for the toast image ----------------------------------------
+
+    // 256x256 rounded square in <color> with the text centred in white (same shape as the built-in icon)
+    private static int MakeIcon(string text, string colorHex, string outPath)
+    {
+        int rgb;
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(outPath) ||
+            !int.TryParse(colorHex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out rgb)) return 1;
+
+        const int size = 256;
+        const int corner = 56;
+        Color fill = Color.FromArgb(255, (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+        using (Bitmap bmp = new Bitmap(size, size))
+        using (Graphics g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            g.Clear(Color.Transparent);
+            using (GraphicsPath path = new GraphicsPath())
+            {
+                path.AddArc(0, 0, corner, corner, 180, 90);
+                path.AddArc(size - corner, 0, corner, corner, 270, 90);
+                path.AddArc(size - corner, size - corner, corner, corner, 0, 90);
+                path.AddArc(0, size - corner, corner, corner, 90, 90);
+                path.CloseFigure();
+                using (Brush brush = new SolidBrush(fill)) g.FillPath(brush, path);
+            }
+            float pixels = text.Length > 1 ? 112f : 150f;
+            using (Font font = new Font("Segoe UI", pixels, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (StringFormat format = new StringFormat())
+            {
+                format.Alignment = StringAlignment.Center;
+                format.LineAlignment = StringAlignment.Center;
+                g.DrawString(text, font, Brushes.White, new RectangleF(0, 4, size, size), format);
+            }
+            // write next to the target and copy over it, so a reader never sees a half-written PNG
+            string tmp = outPath + "." + Process.GetCurrentProcess().Id + ".tmp";
+            bmp.Save(tmp, ImageFormat.Png);
+            File.Copy(tmp, outPath, true);
+            File.Delete(tmp);
+        }
+        return 0;
     }
 
     // ---- capture: first ancestor process that owns a top-level window ---------------------------

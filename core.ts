@@ -229,27 +229,94 @@ export interface Origin {
   cwd: string;
   project: string;
   herdrPaneId?: string;
-  wtSession?: string;
   hwnd?: string;
 }
 
 export function createOrigin(cwd: string, env: NodeJS.ProcessEnv = process.env): Origin {
   const herdrPaneId = env.HERDR_ENV === "1" ? text(env.HERDR_PANE_ID) : undefined;
-  const wtSession = text(env.WT_SESSION)?.replace(/[{}-]/g, "").slice(0, 8);
   return {
     cwd,
     project: basename(cwd) || cwd,
     ...(herdrPaneId ? { herdrPaneId } : {}),
-    ...(wtSession ? { wtSession } : {}),
   };
 }
 
+/** toast 末尾的来源行只写项目名；pane/终端会话 id 对人没有意义，不显示。 */
 export function sourceLine(origin: Origin): string {
-  if (origin.herdrPaneId) return `${origin.project} · pane ${origin.herdrPaneId}`;
-  if (origin.wtSession) return `${origin.project} · WT ${origin.wtSession}`;
   return origin.project;
 }
 
 export function appendSource(message: string, origin: Origin): string {
   return `${message}\n\n${sourceLine(origin)}`;
+}
+
+/** clickable-toast.json：开关、调试和 toast 外观。 */
+export interface ClickableConfig {
+  enabled: boolean;
+  debug: boolean;
+  /** 是否在 toast 末尾追加项目名，默认关闭。 */
+  showSource: boolean;
+  /** 是否用项目名生成 toast 左侧的大图（首字母 + 固定颜色），默认开启；配置了 icon 时以 icon 为准。 */
+  projectIcon: boolean;
+  /** toast 左上角显示的应用名。 */
+  appName: string;
+  /** 自定义图标（png/jpg/ico 路径），缺省用扩展自带的图标。 */
+  icon?: string;
+}
+
+export const DEFAULT_APP_NAME = "Pi";
+
+export function normalizeClickableConfig(raw: unknown): ClickableConfig {
+  const value = (raw !== null && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const icon = text(value.icon);
+  return {
+    enabled: value.enabled !== false,
+    debug: value.debug === true,
+    showSource: value.showSource === true,
+    projectIcon: value.projectIcon !== false,
+    appName: text(value.appName) ?? DEFAULT_APP_NAME,
+    ...(icon ? { icon } : {}),
+  };
+}
+
+export interface ProjectIconSpec {
+  /** 图标上显示的 1~2 个字符。 */
+  letter: string;
+  /** 背景色，RRGGBB。 */
+  color: string;
+}
+
+/**
+ * 按项目名生成图标的文字和颜色。同一个项目永远得到同一个结果（颜色来自名字的哈希），
+ * 大小写不同的同名目录也得到同一个颜色。
+ * 文字：名字里有分隔符（- _ 空格 .）就取前两个词的首字母，否则取第一个字符。
+ */
+export function projectIconSpec(project: string): ProjectIconSpec {
+  const words = project.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const initials = words.slice(0, 2).map((word) => Array.from(word)[0].toUpperCase()).join("");
+
+  // FNV-1a 哈希 -> 色相；饱和度和亮度固定，保证白字在任何色相上都看得清。
+  // 先归一化：统一小写并把分隔符（- _ 空格 . 等）都去掉，同一项目的不同写法得到同一颜色。
+  let hash = 0x811c9dc5;
+  const normalized = project.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash = Math.imul(hash ^ normalized.charCodeAt(i), 0x01000193) >>> 0;
+  }
+  return { letter: initials || "π", color: hslToHex(hash % 360, 0.52, 0.38) };
+}
+
+function hslToHex(hue: number, saturation: number, lightness: number): string {
+  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+  const x = chroma * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = lightness - chroma / 2;
+  const [r, g, b] =
+    hue < 60 ? [chroma, x, 0] :
+    hue < 120 ? [x, chroma, 0] :
+    hue < 180 ? [0, chroma, x] :
+    hue < 240 ? [0, x, chroma] :
+    hue < 300 ? [x, 0, chroma] : [chroma, 0, x];
+  return [r, g, b]
+    .map((channel) => Math.round((channel + m) * 255).toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase();
 }
