@@ -1,14 +1,63 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import test from "node:test";
 import type { Origin } from "../core.ts";
 import {
   ToastController,
+  buildNativeHelper,
   captureTerminalWindowHandle,
   focusOrigin,
+  helperCommand,
+  parseHerdrFocusOutput,
   withoutHerdrEnv,
   type ExecFileLike,
   type NotifierLike,
 } from "../windows.ts";
+
+test("parses herdr-focus output in both the old and the new format", () => {
+  assert.deepEqual(parseHerdrFocusOutput("42015824\r\n"), { hwnd: "42015824" });
+  // 辅助程序现在会附带前置方法和 tab 切换结果；旧正则 /^[0-9]+$/ 会把它误判为失败
+  assert.deepEqual(parseHerdrFocusOutput("42015824 via=alt tab=selected\r\n"), {
+    hwnd: "42015824",
+    via: "alt",
+    tab: "selected",
+  });
+  assert.equal(parseHerdrFocusOutput(""), undefined);
+  assert.equal(parseHerdrFocusOutput("0"), undefined);
+  assert.equal(parseHerdrFocusOutput("no herdr client window found"), undefined);
+});
+
+test("prefers the native helper once it exists and falls back to PowerShell otherwise", () => {
+  const native = helperCommand(() => true);
+  assert.equal(native.native, true);
+  assert.match(native.file, /PiToastFocus-[0-9a-f]{12}\.exe$/);
+  assert.deepEqual(native.args, []);
+
+  const fallback = helperCommand(() => false);
+  assert.equal(fallback.native, false);
+  assert.equal(fallback.file, "powershell.exe");
+  assert.ok(fallback.args.includes("-File"));
+});
+
+test("focus.cs compiles with the in-box csc and the exe answers harmless queries", async () => {
+  assert.equal(await buildNativeHelper(), true, "csc build failed");
+  const helper = helperCommand();
+  assert.equal(helper.native, true);
+  assert.ok(existsSync(helper.file));
+  // 只跑不会改变前台窗口的动作：未知动作、缺参数、不存在的窗口句柄
+  const exit = (args: string[]): number => {
+    try {
+      execFileSync(helper.file, args, { stdio: "ignore" });
+      return 0;
+    } catch (error) {
+      return (error as { status?: number }).status ?? -1;
+    }
+  };
+  assert.equal(exit([]), 1);
+  assert.equal(exit(["-Action", "bogus", "-Value", "1"]), 1);
+  assert.equal(exit(["-Action", "foreground", "-Value", "1"]), 0);
+});
 
 test("strips HERDR_* so a spawned attach is not treated as nested herdr", () => {
   const env = withoutHerdrEnv({
@@ -78,17 +127,20 @@ test("brings the herdr terminal window forward then focuses the exact pane", asy
   const calls: Call[] = [];
   const run: ExecFileLike = async (file, args) => {
     calls.push({ file, args });
-    // herdr-focus 返回 Herdr 所在 WT 窗口句柄
-    if (args.includes("herdr-focus")) return { stdout: "42015824", stderr: "" };
+    // herdr-focus 返回 Herdr 所在 WT 窗口句柄、前置方法和 tab 切换结果
+    if (args.includes("herdr-focus")) return { stdout: "42015824 via=alt tab=selected", stderr: "" };
     return { stdout: "", stderr: "" };
   };
   const spawned: Call[] = [];
 
   const result = await focusOrigin(herdrOrigin, run, (file, args) => { spawned.push({ file, args }); });
 
-  assert.deepEqual(result, { ok: true, method: "herdr" });
-  assert.deepEqual(calls[0].args.slice(-4), ["-Action", "herdr-focus", "-Value", "1"]);
-  assert.deepEqual(calls[1], { file: "herdr.exe", args: ["agent", "focus", "w4:p12"] });
+  // 真实输出带 via/tab 后仍必须算成功，不能误走 attach 兑底
+  assert.deepEqual(result, { ok: true, method: "herdr", hostVia: "alt", hostTab: "selected" });
+  const hostCall = calls.find((c) => c.args.includes("herdr-focus"));
+  assert.ok(hostCall);
+  assert.deepEqual(hostCall.args.slice(-4), ["-Action", "herdr-focus", "-Value", "1"]);
+  assert.deepEqual(calls.find((c) => c.file === "herdr.exe"), { file: "herdr.exe", args: ["agent", "focus", "w4:p12"] });
   assert.equal(spawned.length, 0, "terminal is already open, must not open another window");
 });
 

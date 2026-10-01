@@ -23,6 +23,7 @@ import {
 } from "./core.ts";
 import {
   ToastController,
+  buildNativeHelper,
   captureTerminalWindowHandle,
   focusOrigin,
   isWindowForeground,
@@ -65,7 +66,7 @@ function loadClickableConfig(): ClickableConfig {
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-01-foreground-lock-bypass";
+const BUILD_TAG = "2026-10-01-native-helper";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -137,6 +138,9 @@ export default function clickableToast(pi: ExtensionAPI): void {
   const refreshWindowHandle = async (): Promise<void> => {
     const target = origin;
     if (!target) return;
+    // Herdr 场景由 herdr-focus 直接查找客户端窗口，用不到 pi 自己的窗口句柄。
+    // 旧的 PowerShell 版每次要跑十几秒 CIM 查询，且每次交互输入都会触发。
+    if (target.herdrPaneId) return;
     const hwnd = await captureTerminalWindowHandle();
     if (origin === target && hwnd) target.hwnd = hwnd;
   };
@@ -232,6 +236,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
     disarmRenotify();
     origin = createOrigin(ctx.cwd);
     debugLog(`session_start: build=${BUILD_TAG} herdrPane=${origin.herdrPaneId ?? "-"} cwd=${ctx.cwd}`);
+    // 后台编译原生辅助程序（仅首次，约 0.7 秒）；未就绪时自动回退到 PowerShell 版。
+    void buildNativeHelper().then((ok) => debugLog(`native helper: ${ok ? "ready" : "unavailable, using PowerShell fallback"}`));
     // 不 await：PowerShell/WMI 冷启动可拖慢 RPC/TUI 启动数秒，
     // 窗口句柄在首次 input 或发 toast 前再取即可。
     void refreshWindowHandle();

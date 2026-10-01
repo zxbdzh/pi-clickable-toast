@@ -1,4 +1,8 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import notifier from "node-notifier";
 import type { Origin } from "./core.ts";
@@ -31,6 +35,7 @@ function systemExecFile(
 
 const POWERSHELL = "powershell.exe";
 const WINDOW_HELPER = fileURLToPath(new URL("./window.ps1", import.meta.url));
+const HELPER_SOURCE = fileURLToPath(new URL("./focus.cs", import.meta.url));
 const POWERSHELL_ARGS = [
   "-NoProfile",
   "-NonInteractive",
@@ -39,6 +44,84 @@ const POWERSHELL_ARGS = [
   "-File",
   WINDOW_HELPER,
 ] as const;
+
+export interface HelperCommand {
+  file: string;
+  args: string[];
+  native: boolean;
+}
+
+let cachedExePath: string | null | undefined;
+
+/** exe 按 focus.cs 内容哈希命名，源码一变就自动重新编译，不会用到过期的二进制。 */
+function nativeHelperPath(): string | undefined {
+  if (cachedExePath === undefined) {
+    try {
+      const hash = createHash("sha256").update(readFileSync(HELPER_SOURCE)).digest("hex").slice(0, 12);
+      cachedExePath = join(tmpdir(), "pi-clickable-toast", `PiToastFocus-${hash}.exe`);
+    } catch {
+      cachedExePath = null;
+    }
+  }
+  return cachedExePath ?? undefined;
+}
+
+/**
+ * 热路径优先用原生 exe（启动几十毫秒），尚未编译或编译失败时回退到 PowerShell 脚本
+ * （启动 + JIT 预热每次 1.1~1.8 秒）。两者命令行约定一致：-Action <名称> -Value <数字>。
+ */
+export function helperCommand(exists: (path: string) => boolean = existsSync): HelperCommand {
+  const exe = nativeHelperPath();
+  if (exe && exists(exe)) return { file: exe, args: [], native: true };
+  return { file: POWERSHELL, args: [...POWERSHELL_ARGS], native: false };
+}
+
+let buildInFlight: Promise<boolean> | undefined;
+
+/** 后台编译 focus.cs；成功后 helperCommand 自动改用 exe。失败则一直走 PowerShell 版。 */
+export function buildNativeHelper(): Promise<boolean> {
+  buildInFlight ??= (async () => {
+    const exe = nativeHelperPath();
+    if (!exe) return false;
+    if (existsSync(exe)) return true;
+    const windir = process.env.windir ?? "C:\\Windows";
+    const framework = ["Framework64", "Framework"]
+      .map((dir) => join(windir, "Microsoft.NET", dir, "v4.0.30319"))
+      .find((dir) => existsSync(join(dir, "csc.exe")));
+    if (!framework) return false;
+    const wpf = join(framework, "WPF");
+    const tmp = `${exe}.${process.pid}.tmp`;
+    try {
+      mkdirSync(join(tmpdir(), "pi-clickable-toast"), { recursive: true });
+      await systemExecFile(
+        join(framework, "csc.exe"),
+        [
+          "-nologo",
+          "-optimize+",
+          "-target:exe",
+          `-out:${tmp}`,
+          `-r:${join(wpf, "UIAutomationClient.dll")}`,
+          `-r:${join(wpf, "UIAutomationTypes.dll")}`,
+          `-r:${join(wpf, "WindowsBase.dll")}`,
+          HELPER_SOURCE,
+        ],
+        { timeout: 60_000, windowsHide: true },
+      );
+      renameSync(tmp, exe);
+      return true;
+    } catch {
+      rmSync(tmp, { force: true });
+      // 另一个 pi 进程可能已经编译并占用了目标文件
+      return existsSync(exe);
+    }
+  })();
+  return buildInFlight;
+}
+
+function helperInvocation(action: string, value: string | number): { file: string; args: string[] } {
+  const helper = helperCommand();
+  return { file: helper.file, args: [...helper.args, "-Action", action, "-Value", numeric(value)] };
+}
 
 function numeric(value: string | number): string {
   const result = String(value);
@@ -54,15 +137,12 @@ export async function captureTerminalWindowHandle(
   const candidates = [...new Set([pid, fallbackPid].filter((value) => value > 0))];
   for (const candidate of candidates) {
     try {
-      const { stdout } = await run(
-        POWERSHELL,
-        [...POWERSHELL_ARGS, "-Action", "capture", "-Value", numeric(candidate)],
-        { timeout: 5_000, windowsHide: true, encoding: "utf8" },
-      );
+      const call = helperInvocation("capture", candidate);
+      const { stdout } = await run(call.file, call.args, { timeout: 5_000, windowsHide: true, encoding: "utf8" });
       const value = stdout.trim();
       if (/^\d+$/.test(value) && value !== "0") return value;
     } catch {
-      // A just-started process may not be visible to CIM yet; try its parent.
+      // A just-started process may not be visible yet; try its parent.
     }
   }
   return undefined;
@@ -74,11 +154,8 @@ export async function isWindowForeground(
 ): Promise<boolean> {
   if (!hwnd) return false;
   try {
-    const { stdout } = await run(
-      POWERSHELL,
-      [...POWERSHELL_ARGS, "-Action", "foreground", "-Value", numeric(hwnd)],
-      { timeout: 5_000, windowsHide: true, encoding: "utf8" },
-    );
+    const call = helperInvocation("foreground", hwnd);
+    const { stdout } = await run(call.file, call.args, { timeout: 5_000, windowsHide: true, encoding: "utf8" });
     return stdout.trim() === "True";
   } catch {
     return false;
@@ -86,11 +163,8 @@ export async function isWindowForeground(
 }
 
 async function focusWindow(hwnd: string, run: ExecFileLike): Promise<void> {
-  await run(
-    POWERSHELL,
-    [...POWERSHELL_ARGS, "-Action", "focus", "-Value", numeric(hwnd)],
-    { timeout: 5_000, windowsHide: true, encoding: "utf8" },
-  );
+  const call = helperInvocation("focus", hwnd);
+  await run(call.file, call.args, { timeout: 5_000, windowsHide: true, encoding: "utf8" });
 }
 
 export interface FocusResult {
@@ -98,7 +172,23 @@ export interface FocusResult {
   method?: "herdr" | "window";
   degraded?: boolean;
   attached?: boolean;
+  /** 前置终端窗口用的方法（already/alt/attach/switch），仅用于调试日志。 */
+  hostVia?: string;
+  /** Herdr 所在 tab 的切换结果（already/selected/notfound/failed）。 */
+  hostTab?: string;
+  hostError?: string;
   error?: string;
+}
+
+/** 解析 herdr-focus 的输出：`<hwnd> via=<方法> tab=<状态>`，后两段可缺省。 */
+export function parseHerdrFocusOutput(stdout: string): { hwnd: string; via?: string; tab?: string } | undefined {
+  const match = /^([0-9]+)(?:\s+via=(\S+))?(?:\s+tab=(\S+))?/.exec(stdout.trim());
+  if (!match || match[1] === "0") return undefined;
+  return {
+    hwnd: match[1],
+    ...(match[2] ? { via: match[2] } : {}),
+    ...(match[3] ? { tab: match[3] } : {}),
+  };
 }
 
 export type SpawnDetachedLike = (file: string, args: readonly string[]) => void;
@@ -129,32 +219,37 @@ export async function focusOrigin(
 ): Promise<FocusResult> {
   let herdrError: string | undefined;
   if (origin.herdrPaneId) {
-    // Herdr 界面是独立的客户端进程，不在 pi 的父进程链上，所以由脚本直接查找它所在的
-    // Windows Terminal 窗口（必要时切到对应 tab）并前置，再切 Herdr 内部焦点并标记已看。
-    let hostFocused = false;
-    let hostError: string | undefined;
-    try {
-      const { stdout } = await run(
-        POWERSHELL,
-        [...POWERSHELL_ARGS, "-Action", "herdr-focus", "-Value", "1"],
-        { timeout: 10_000, windowsHide: true, encoding: "utf8" },
-      );
-      hostFocused = /^[0-9]+$/.test(stdout.trim());
-    } catch (error) {
-      // 找不到界面客户端或前台被系统拒绝；记录原因，再走 attach 兜底
-      hostError = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 240);
-    }
-    try {
-      await run("herdr.exe", ["agent", "focus", origin.herdrPaneId], {
+    // Herdr 界面是独立的客户端进程，不在 pi 的父进程链上，所以由辅助程序直接查找它所在的
+    // Windows Terminal 窗口（必要时切到对应 tab）并前置；同时切 Herdr 内部焦点并标记已看。
+    // 两件事互不依赖，并行执行以缩短点击后的等待。
+    const call = helperInvocation("herdr-focus", 1);
+    const [host, focusError] = await Promise.all([
+      run(call.file, call.args, { timeout: 10_000, windowsHide: true, encoding: "utf8" }).then(
+        ({ stdout }) => ({ parsed: parseHerdrFocusOutput(stdout), error: undefined as string | undefined }),
+        // 找不到界面客户端或前台被系统拒绝；记录原因，再走 attach 兜底
+        (error: unknown) => ({
+          parsed: undefined,
+          error: (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 240),
+        }),
+      ),
+      run("herdr.exe", ["agent", "focus", origin.herdrPaneId], {
         timeout: 5_000,
         windowsHide: true,
         encoding: "utf8",
-      });
-    } catch (error) {
-      herdrError = error instanceof Error ? error.message : String(error);
-    }
-    if (hostFocused && herdrError === undefined) {
-      return { ok: true, method: "herdr" };
+      }).then(
+        () => undefined,
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+    ]);
+    const hostError = host.error;
+    herdrError = focusError;
+    if (host.parsed && herdrError === undefined) {
+      return {
+        ok: true,
+        method: "herdr",
+        ...(host.parsed.via ? { hostVia: host.parsed.via } : {}),
+        ...(host.parsed.tab ? { hostTab: host.parsed.tab } : {}),
+      };
     }
     // 没有可前置的界面窗口或 focus 失败：新开窗口 attach 常驻 session。
     // ponytail: 必须用 spawn detached 而非 execFile —— start 打开的 cmd /k 是常驻进程，
