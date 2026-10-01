@@ -203,17 +203,20 @@ export class ToastController {
   private readonly onActivate: () => void | Promise<void>;
   private readonly onError: (error: Error) => void;
   private readonly client: NotifierLike;
+  private readonly onEvent?: (response?: string, metadata?: Record<string, unknown>) => void;
 
   constructor(
     id: string,
     onActivate: () => void | Promise<void>,
     onError: (error: Error) => void,
     client: NotifierLike = notifier as unknown as NotifierLike,
+    onEvent?: (response?: string, metadata?: Record<string, unknown>) => void,
   ) {
     this.id = id;
     this.onActivate = onActivate;
     this.onError = onError;
     this.client = client;
+    this.onEvent = onEvent;
   }
 
   show(title: string, message: string, appID?: string): void {
@@ -232,6 +235,7 @@ export class ToastController {
           this.onError(error);
           return;
         }
+        this.onEvent?.(response, metadata);
         if (activated(response, metadata)) void this.onActivate();
       },
     );

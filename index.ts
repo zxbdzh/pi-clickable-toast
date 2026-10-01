@@ -4,7 +4,7 @@ import type {
   ToolCallEvent,
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -44,6 +44,7 @@ const SHARED_TASK_REGISTRY = Symbol.for("unipi.background-tasks.shared-registry"
 
 interface ClickableConfig {
   enabled: boolean;
+  debug: boolean;
 }
 
 interface ManualNotification {
@@ -59,8 +60,22 @@ function parseJson(path: string): unknown {
 }
 
 function loadClickableConfig(): ClickableConfig {
-  const value = parseJson(CLICKABLE_CONFIG_PATH) as { enabled?: unknown };
-  return { enabled: value.enabled !== false };
+  const value = parseJson(CLICKABLE_CONFIG_PATH) as { enabled?: unknown; debug?: unknown };
+  return { enabled: value.enabled !== false, debug: value.debug === true };
+}
+
+// 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
+const BUILD_TAG = "2026-10-01-herdr-client-focus";
+const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
+
+/** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
+function debugLog(message: string): void {
+  try {
+    if (!loadClickableConfig().debug) return;
+    appendFileSync(DEBUG_LOG_PATH, `${new Date().toISOString()} pid=${process.pid} ${message}\n`);
+  } catch {
+    // ignore
+  }
 }
 
 function loadNotifyConfig(): NotifyConfig {
@@ -90,6 +105,10 @@ export default function clickableToast(pi: ExtensionAPI): void {
   let lastAutomatic: { signature: string; at: number } | undefined;
   const pendingManual = new Map<string, ManualNotification>();
   const reported = new Set<string>();
+
+  const onToastEvent = (response?: string, metadata?: Record<string, unknown>): void => {
+    debugLog(`toast callback: response=${JSON.stringify(response)} action=${String(metadata?.action ?? "")}`);
+  };
 
   const reportOnce = (key: string, message: string): void => {
     if (reported.has(key)) return;
@@ -124,7 +143,9 @@ export default function clickableToast(pi: ExtensionAPI): void {
 
   const activateOrigin = async (): Promise<void> => {
     if (!origin) return;
+    debugLog(`activate: start origin=${JSON.stringify(origin)}`);
     const result = await focusOrigin(origin);
+    debugLog(`activate: result=${JSON.stringify(result)}`);
     if (!result.ok) {
       reportOnce("focus", `could not focus the source terminal: ${result.error ?? "unknown error"}`);
     } else if (result.degraded) {
@@ -142,6 +163,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
     if (!origin || !controller) return false;
     if (!force && shouldSilenceNative(notify, eventKey, lastInputAt)) return false;
     if (!force && notify.native.suppressWhenFocused && await isWindowForeground(origin.hwnd)) return false;
+    debugLog(`show: event=${eventKey} title=${JSON.stringify(title)}`);
     controller.show(title, appendSource(message, origin), notify.native.windowsAppId);
     return true;
   };
@@ -209,6 +231,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
     pendingManual.clear();
     disarmRenotify();
     origin = createOrigin(ctx.cwd);
+    debugLog(`session_start: build=${BUILD_TAG} herdrPane=${origin.herdrPaneId ?? "-"} cwd=${ctx.cwd}`);
     // 不 await：PowerShell/WMI 冷启动可拖慢 RPC/TUI 启动数秒，
     // 窗口句柄在首次 input 或发 toast 前再取即可。
     void refreshWindowHandle();
@@ -216,6 +239,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
       `pi-clickable-toast-${process.pid}`,
       activateOrigin,
       (error) => reportOnce("toast", error.message),
+      undefined,
+      onToastEvent,
     );
     registerBusListeners();
 
@@ -311,6 +336,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
           `pi-clickable-toast-${process.pid}`,
           activateOrigin,
           (error) => reportOnce("toast", error.message),
+          undefined,
+          onToastEvent,
         );
       }
       const loaded = readConfig();

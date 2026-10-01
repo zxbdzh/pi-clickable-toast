@@ -21,6 +21,27 @@ test("strips HERDR_* so a spawned attach is not treated as nested herdr", () => 
   assert.deepEqual(env, { PATH: "C:/bin", USERPROFILE: "C:/Users/1" });
 });
 
+test("reports every toast callback (including timedout) to onEvent", async () => {
+  let captured: ((error: Error | null, response?: string, metadata?: Record<string, unknown>) => void) | undefined;
+  const client: NotifierLike = { notify(_options, callback) { captured = callback; } };
+  const events: Array<{ response?: string; action?: unknown }> = [];
+  let activations = 0;
+  const controller = new ToastController(
+    "toast-1",
+    () => { activations += 1; },
+    () => {},
+    client,
+    (response, metadata) => events.push({ response, action: metadata?.action }),
+  );
+
+  controller.show("t", "m");
+  captured?.(null, "timeout", { action: "timedout" });
+
+  // 弹窗超时必须可见于日志，但不能触发聚焦
+  assert.deepEqual(events, [{ response: "timeout", action: "timedout" }]);
+  assert.equal(activations, 0);
+});
+
 test("uses one notification id and ignores clicks from replaced toasts", async () => {
   const calls: Array<{
     options: Record<string, unknown>;
