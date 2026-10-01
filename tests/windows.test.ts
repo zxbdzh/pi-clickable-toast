@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { projectIconSpec, type Origin } from "../core.ts";
 import {
-  ToastController,
+  NativeToast,
   buildNativeHelper,
   captureTerminalWindowHandle,
   ensureProjectIcon,
@@ -16,7 +16,6 @@ import {
   registerToastApp,
   withoutHerdrEnv,
   type ExecFileLike,
-  type NotifierLike,
 } from "../windows.ts";
 
 test("parses herdr-focus output in both the old and the new format", () => {
@@ -126,92 +125,109 @@ test("falls back to the built-in icon when the helper cannot draw", async () => 
   assert.equal(await ensureProjectIcon("demo", { ...deps, helper: async () => undefined }), undefined);
 });
 
-test("passes the app identity and icon through to the toast", () => {
-  const sent: Array<Record<string, unknown>> = [];
-  const client: NotifierLike = { notify(options) { sent.push(options); } };
-  const controller = new ToastController("toast-1", () => {}, () => {}, client);
-
-  controller.show("t", "m", { appID: "Pi.ClickableToast", icon: "C:/icons/pi.png" });
-  controller.show("t2", "m2");
-
-  assert.equal(sent[0].appID, "Pi.ClickableToast");
-  assert.equal(sent[0].icon, "C:/icons/pi.png");
-  // 不传外观时不能带空字段（空 appID 会让 SnoreToast 报错）
-  assert.equal("appID" in sent[1], false);
-  assert.equal("icon" in sent[1], false);
-});
-
-test("registers the app identity under HKCU with name and icon, without admin rights", async () => {
-  const calls: Array<{ file: string; args: readonly string[] }> = [];
-  const run: ExecFileLike = async (file, args) => { calls.push({ file, args }); return { stdout: "", stderr: "" }; };
-
-  const ok = await registerToastApp({ id: "Pi.ClickableToast", name: "Pi", icon: "C:\\x\\icon.png" }, run);
-
-  assert.equal(ok, true);
-  assert.equal(calls.length, 2);
-  for (const call of calls) {
-    assert.equal(call.file, "reg.exe");
-    assert.equal(call.args[1], "HKCU\\Software\\Classes\\AppUserModelId\\Pi.ClickableToast");
-    assert.ok(call.args.includes("/f"));
-  }
-  const byName = new Map(calls.map((c) => [c.args[3], c.args[7]]));
-  assert.equal(byName.get("DisplayName"), "Pi");
-  assert.equal(byName.get("IconUri"), "C:\\x\\icon.png");
-});
-
-test("reports failure instead of throwing so callers can fall back to the default identity", async () => {
-  const run: ExecFileLike = async () => { throw new Error("access denied"); };
-  assert.equal(await registerToastApp({ id: "Pi.ClickableToast", name: "Pi", icon: "C:\\x.png" }, run), false);
-});
-
-test("reports every toast callback (including timedout) to onEvent", async () => {
-  let captured: ((error: Error | null, response?: string, metadata?: Record<string, unknown>) => void) | undefined;
-  const client: NotifierLike = { notify(_options, callback) { captured = callback; } };
-  const events: Array<{ response?: string; action?: unknown }> = [];
-  let activations = 0;
-  const controller = new ToastController(
-    "toast-1",
-    () => { activations += 1; },
+test("passes identity, icon and tag to the native toast helper", () => {
+  const spawned: Array<{ file: string; args: readonly string[] }> = [];
+  let activator: (() => void | Promise<void>) | undefined;
+  const toast = new NativeToast(
+    () => { activator?.(); },
     () => {},
-    client,
-    (response, metadata) => events.push({ response, action: metadata?.action }),
+    undefined,
+    () => "X:/fake/PiToastFocus.exe",
+    ((file: string, args: readonly string[]) => {
+      spawned.push({ file, args });
+      return { stdout: { on() {} }, once() {}, kill() {}, removeAllListeners() {} };
+    }) as unknown as typeof spawn,
   );
 
-  controller.show("t", "m");
-  captured?.(null, "timeout", { action: "timedout" });
-
-  // 弹窗超时必须可见于日志，但不能触发聚焦
-  assert.deepEqual(events, [{ response: "timeout", action: "timedout" }]);
-  assert.equal(activations, 0);
+  assert.equal(toast.show("Title", "Body", { appID: "Pi.AgentToast", icon: "C:/i.png", tag: "pi-1" }), true);
+  assert.equal(spawned[0].file, "X:/fake/PiToastFocus.exe");
+  assert.deepEqual(spawned[0].args, [
+    "-Action", "toast", "-Title", "Title", "-Message", "Body",
+    "-AppID", "Pi.AgentToast", "-ParentPid", String(process.pid),
+    "-Icon", "C:/i.png", "-Tag", "pi-1",
+  ]);
 });
 
-test("uses one notification id and ignores clicks from replaced toasts", async () => {
-  const calls: Array<{
-    options: Record<string, unknown>;
-    callback?: (error: Error | null, response?: string, metadata?: Record<string, unknown>) => void;
-  }> = [];
-  const client: NotifierLike = {
-    notify(options, callback) {
-      calls.push({ options, callback });
-    },
-  };
+test("does not show anything without the helper or an app id", () => {
+  const spawned: unknown[] = [];
+  const spawnStub = ((file: string, args: readonly string[]) => {
+    spawned.push([file, args]);
+    return { stdout: { on() {} }, once() {}, kill() {}, removeAllListeners() {} };
+  }) as unknown as typeof spawn;
+
+  const noHelper = new NativeToast(() => {}, () => {}, undefined, () => undefined, spawnStub);
+  assert.equal(noHelper.show("t", "m", { appID: "Pi.AgentToast" }), false);
+
+  const noAppId = new NativeToast(() => {}, () => {}, undefined, () => "X:/fake.exe", spawnStub);
+  assert.equal(noAppId.show("t", "m", {}), false);
+  assert.equal(spawned.length, 0);
+});
+
+test("focuses only when the helper reports the toast was clicked", async () => {
   let activations = 0;
-  const errors: Error[] = [];
-  const controller = new ToastController("session-7", () => { activations += 1; }, (error) => errors.push(error), client);
+  const events: string[] = [];
+  const makeToast = (output: string) =>
+    new NativeToast(
+      () => { activations += 1; },
+      () => {},
+      (result) => events.push(result),
+      () => "X:/fake.exe",
+      (() => {
+        let onData: ((chunk: Buffer) => void) | undefined;
+        let onClose: (() => void) | undefined;
+        const child = {
+          stdout: { on(_event: string, cb: (chunk: Buffer) => void) { onData = cb; } },
+          once(event: string, cb: () => void) { if (event === "close") onClose = cb; },
+          kill() {},
+          removeAllListeners() {},
+        };
+        // 真实顺序：helper 先写结果到 stdout，然后退出触发 close
+        setImmediate(() => { onData?.(Buffer.from(output)); onClose?.(); });
+        return child;
+      }) as unknown as typeof spawn,
+    );
 
-  controller.show("First", "one");
-  controller.show("Second", "two");
-  assert.equal(calls[0].options.id, "session-7");
-  assert.equal(calls[1].options.id, "session-7");
-
-  calls[0].callback?.(null, "activate");
-  calls[1].callback?.(null, "activate");
-  await Promise.resolve();
+  makeToast("activated").show("t", "m", { appID: "Pi.AgentToast" });
+  await new Promise((resolve) => setTimeout(resolve, 15));
   assert.equal(activations, 1);
-  assert.deepEqual(errors, []);
+  assert.deepEqual(events, ["activated"]);
 
-  controller.close();
-  assert.equal(calls.length, 2);
+  // 通知中心里被关掉，或者长时间没人点：不能触发聚焦
+  makeToast("dismissed").show("t", "m", { appID: "Pi.AgentToast" });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  makeToast("timeout").show("t", "m", { appID: "Pi.AgentToast" });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  assert.equal(activations, 1, "只有 activated 才聚焦");
+  assert.deepEqual(events, ["activated", "dismissed", "timeout"]);
+});
+
+test("replaces the previous toast process instead of stacking listeners", () => {
+  const killed: number[] = [];
+  let sequence = 0;
+  const toast = new NativeToast(
+    () => {},
+    () => {},
+    undefined,
+    () => "X:/fake.exe",
+    (() => {
+      const id = sequence++;
+      const child = {
+        stdout: { on() {} },
+        once() {},
+        kill() { killed.push(id); },
+        removeAllListeners() {},
+      };
+      return child;
+    }) as unknown as typeof spawn,
+  );
+
+  toast.show("First", "one", { appID: "Pi.AgentToast" });
+  toast.show("Second", "two", { appID: "Pi.AgentToast" });
+  assert.deepEqual(killed, [0], "first toast process must be killed when replaced");
+
+  toast.close();
+  assert.deepEqual(killed, [0, 1]);
 });
 
 type Call = { file: string; args: readonly string[] };

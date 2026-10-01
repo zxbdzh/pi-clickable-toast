@@ -21,7 +21,7 @@ cd "%USERPROFILE%\.pi\agent\extensions\clickable-toast"
 npm install
 ```
 
-依赖锁定的 `node-notifier@10.0.1`（自带，不污染全局）。
+无运行时依赖：toast 和窗口定位都由 `focus.cs` 编译出的原生 exe 完成（见下）。
 
 ## 配置
 
@@ -87,8 +87,9 @@ npm run smoke:rpc # 端到端冒烟：spawn RPC 模式 pi → 触发 toast → �
 ## 已知限制
 
 - Windows Terminal 只能恢复到窗口级，不定位到具体 tab/pane（WT 无公开的反查 API）
-- node-notifier 的 Windows toaster 不支持主动移除 toast，靠系统自动过期
-- 点击回调依赖 pi 进程存活（SnoreToast 通过 named pipe 回调）；pi 退出后 toast 不再可点
+- 通知中心里的旧通知靠系统自行过期（12 小时），扩展不会主动清理别的会话的通知
+- 点击回调依赖 pi 进程存活（helper 常驻等待系统事件）；pi 退出后通知中心里的条目不再可点
+- 需要 Windows SDK 的 `Windows.winmd` 才能编译 toast 支持；缺失时 toast 不显示并在 pi 里提示一次
 
 ## License
 

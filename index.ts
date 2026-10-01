@@ -25,8 +25,8 @@ import {
 } from "./core.ts";
 import {
   DEFAULT_ICON,
+  NativeToast,
   TOAST_APP_ID,
-  ToastController,
   buildNativeHelper,
   captureTerminalWindowHandle,
   ensureProjectIcon,
@@ -74,7 +74,7 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-01-project-icon";
+const BUILD_TAG = "2026-10-01-winrt-toast";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -107,7 +107,8 @@ function hasPendingWakeTask(): boolean {
 export default function clickableToast(pi: ExtensionAPI): void {
   let context: ExtensionContext | undefined;
   let origin: Origin | undefined;
-  let controller: ToastController | undefined;
+  let controller: NativeToast | undefined;
+  let nativeToastReady = false;
   let lastInputAt = 0;
   let renotifyTimer: ReturnType<typeof setInterval> | undefined;
   let busUnsubscribers: Array<() => void> = [];
@@ -115,8 +116,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
   const pendingManual = new Map<string, ManualNotification>();
   const reported = new Set<string>();
 
-  const onToastEvent = (response?: string, metadata?: Record<string, unknown>): void => {
-    debugLog(`toast callback: response=${JSON.stringify(response)} action=${String(metadata?.action ?? "")}`);
+  const onToastEvent = (result: string): void => {
+    debugLog(`toast result: ${result}`);
   };
 
   const reportOnce = (key: string, message: string): void => {
@@ -209,9 +210,15 @@ export default function clickableToast(pi: ExtensionAPI): void {
     const clickable = readConfig()?.clickable;
     const appearance = clickable ? await resolveAppearance(clickable, notify) : {};
     debugLog(`show: event=${eventKey} title=${JSON.stringify(title)} appID=${appearance.appID ?? "default"} icon=${appearance.icon ?? "-"}`);
-    controller.show(title, clickable?.showSource ? appendSource(message, origin) : message, appearance);
-    return true;
+    const body = clickable?.showSource ? appendSource(message, origin) : message;
+    // 只用 WinRT 通道：SnoreToast 在带应用标识时收不到点击，而没应用的 toast 名字就叫 SnoreToast。
+    const shown = nativeToastReady && controller.show(title, body, { ...appearance, tag: originWideTag() });
+    if (!shown) reportOnce("toast-channel", "native toast unavailable; the notification was not shown");
+    return shown;
   };
+
+  /** 每个 pi 会话一个 tag，同一会话的新通知替换旧通知，不同会话互不影响。 */
+  const originWideTag = (): string => `pi-${process.pid}`;
 
   const armRenotify = (
     eventKey: KnownEvent,
@@ -277,18 +284,15 @@ export default function clickableToast(pi: ExtensionAPI): void {
     disarmRenotify();
     origin = createOrigin(ctx.cwd);
     debugLog(`session_start: build=${BUILD_TAG} herdrPane=${origin.herdrPaneId ?? "-"} cwd=${ctx.cwd}`);
-    // 后台编译原生辅助程序（仅首次，约 0.7 秒）；未就绪时自动回退到 PowerShell 版。
-    void buildNativeHelper().then((ok) => debugLog(`native helper: ${ok ? "ready" : "unavailable, using PowerShell fallback"}`));
+    // 后台编译原生辅助程序（仅首次，约 0.7 秒）；就绪前发的 toast 会被跳过并提示。
+    controller = new NativeToast(activateOrigin, (error) => reportOnce("toast", error.message), onToastEvent);
+    void buildNativeHelper().then((ok) => {
+      nativeToastReady = ok;
+      debugLog(`native helper: ${ok ? "ready" : "unavailable, toast disabled"}`);
+    });
     // 不 await：PowerShell/WMI 冷启动可拖慢 RPC/TUI 启动数秒，
     // 窗口句柄在首次 input 或发 toast 前再取即可。
     void refreshWindowHandle();
-    controller = new ToastController(
-      `pi-clickable-toast-${process.pid}`,
-      activateOrigin,
-      (error) => reportOnce("toast", error.message),
-      undefined,
-      onToastEvent,
-    );
     registerBusListeners();
 
     const loaded = readConfig();
@@ -379,13 +383,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
       if (!origin) origin = createOrigin(ctx.cwd);
       await refreshWindowHandle();
       if (!controller) {
-        controller = new ToastController(
-          `pi-clickable-toast-${process.pid}`,
-          activateOrigin,
-          (error) => reportOnce("toast", error.message),
-          undefined,
-          onToastEvent,
-        );
+        controller = new NativeToast(activateOrigin, (error) => reportOnce("toast", error.message), onToastEvent);
+        nativeToastReady = await buildNativeHelper();
       }
       const loaded = readConfig();
       if (!loaded?.clickable.enabled) {

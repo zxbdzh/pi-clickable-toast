@@ -1,18 +1,10 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import notifier from "node-notifier";
 import { projectIconSpec, type Origin } from "./core.ts";
-
-export interface NotifierLike {
-  notify(
-    options: Record<string, unknown>,
-    callback?: (error: Error | null, response?: string, metadata?: Record<string, unknown>) => void,
-  ): unknown;
-}
 
 export type ExecFileLike = (
   file: string,
@@ -76,6 +68,39 @@ export function helperCommand(exists: (path: string) => boolean = existsSync): H
   return { file: POWERSHELL, args: [...POWERSHELL_ARGS], native: false };
 }
 
+const WINMD_CANDIDATES = [
+  "C:\\Program Files (x86)\\Windows Kits\\10\\UnionMetadata",
+  "C:\\Program Files\\Windows Kits\\10\\UnionMetadata",
+];
+
+/** 找 Windows SDK 的 Windows.winmd（ToastNotification 等 WinRT 类型需要它）。 */
+export function findWinmd(exists: (path: string) => boolean = existsSync, read: (dir: string) => string[] = (dir) => readdirSync(dir)): string | undefined {
+  for (const root of WINMD_CANDIDATES) {
+    if (!exists(root)) continue;
+    let entries: string[];
+    try {
+      entries = read(root);
+    } catch {
+      continue;
+    }
+    const versions = entries
+      .map((name) => ({ name, parts: name.split(".").map(Number) }))
+      .filter(({ parts }) => parts.length >= 2 && parts.every((n) => Number.isFinite(n)))
+      .sort((a, b) => {
+        for (let i = 0; i < Math.max(a.parts.length, b.parts.length); i += 1) {
+          const diff = (b.parts[i] ?? 0) - (a.parts[i] ?? 0);
+          if (diff !== 0) return diff;
+        }
+        return 0;
+      });
+    for (const { name } of versions) {
+      const candidate = join(root, name, "Windows.winmd");
+      if (exists(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
 let buildInFlight: Promise<boolean> | undefined;
 
 /** 后台编译 focus.cs；成功后 helperCommand 自动改用 exe。失败则一直走 PowerShell 版。 */
@@ -90,9 +115,20 @@ export function buildNativeHelper(): Promise<boolean> {
       .find((dir) => existsSync(join(dir, "csc.exe")));
     if (!framework) return false;
     const wpf = join(framework, "WPF");
+    const winmd = findWinmd();
     const tmp = `${exe}.${process.pid}.tmp`;
     try {
       mkdirSync(join(tmpdir(), "pi-clickable-toast"), { recursive: true });
+      const references = [
+        join(framework, "System.Drawing.dll"),
+        join(wpf, "UIAutomationClient.dll"),
+        join(wpf, "UIAutomationTypes.dll"),
+        join(wpf, "WindowsBase.dll"),
+      ];
+      // WinRT (toast) 只在 Windows SDK 存在时才能编译；缺了就退化成没有自定义外观的 SnoreToast 路径。
+      if (winmd) {
+        references.push(winmd, join(framework, "System.Runtime.dll"), join(framework, "System.Runtime.WindowsRuntime.dll"), join(framework, "System.Runtime.InteropServices.WindowsRuntime.dll"));
+      }
       await systemExecFile(
         join(framework, "csc.exe"),
         [
@@ -100,13 +136,10 @@ export function buildNativeHelper(): Promise<boolean> {
           "-optimize+",
           "-target:exe",
           `-out:${tmp}`,
-          `-r:${join(framework, "System.Drawing.dll")}`,
-          `-r:${join(wpf, "UIAutomationClient.dll")}`,
-          `-r:${join(wpf, "UIAutomationTypes.dll")}`,
-          `-r:${join(wpf, "WindowsBase.dll")}`,
+          ...references.map((reference) => `-r:${reference}`),
           HELPER_SOURCE,
         ],
-        { timeout: 60_000, windowsHide: true },
+        { timeout: 90_000, windowsHide: true },
       );
       renameSync(tmp, exe);
       return true;
@@ -287,13 +320,6 @@ export async function focusOrigin(
   return { ok: false, error: herdrError ?? "No terminal window handle was captured" };
 }
 
-function activated(response: unknown, metadata: unknown): boolean {
-  const direct = typeof response === "string" ? response.toLowerCase() : "";
-  const meta = metadata !== null && typeof metadata === "object"
-    ? String((metadata as Record<string, unknown>).activationType ?? "").toLowerCase()
-    : "";
-  return direct === "activate" || direct === "click" || meta === "activate" || meta === "click";
-}
 
 /** ensureProjectIcon 的可注入依赖，单测用它们避免真正编译/绘制。 */
 export interface IconDeps {
@@ -353,8 +379,11 @@ export interface ToastAppearance {
 /** 扩展自带的默认图标。 */
 export const DEFAULT_ICON = fileURLToPath(new URL("./assets/icon.png", import.meta.url));
 
-/** 我们自己的应用标识，避免继续用 SnoreToast 的默认身份（名字就是 SnoreToast）。 */
-export const TOAST_APP_ID = "Pi.ClickableToast";
+/**
+ * 我们自己的应用标识，不再用 SnoreToast 的默认身份（名字就是 SnoreToast）。
+ * 用新 ID 而不是沿用旧实验用过的值：通知中心里的旧条目会干扰点击事件的归属。
+ */
+export const TOAST_APP_ID = "Pi.AgentToast";
 
 export interface ToastApp {
   id: string;
@@ -388,58 +417,77 @@ export async function registerToastApp(app: ToastApp, run: ExecFileLike = system
   }
 }
 
-export class ToastController {
-  private generation = 0;
+/**
+ * 用原生辅助程序显示 toast 并接收点击。
+ *
+ * 它替代早先的 SnoreToast 通道：那个库无法在带自定义应用标识时收到点击（通知交给系统平台后
+ * 进程立即退出），而 WinRT 的 Activated 事件在通知中心里点击也能收到。
+ * 每次换通知只保留一个常驻进程（同一个 pi 会话只留最新一条）。
+ */
+export class NativeToast {
+  private child?: ChildProcess;
   private closed = false;
-  private readonly id: string;
   private readonly onActivate: () => void | Promise<void>;
   private readonly onError: (error: Error) => void;
-  private readonly client: NotifierLike;
-  private readonly onEvent?: (response?: string, metadata?: Record<string, unknown>) => void;
+  private readonly onEvent?: (result: string) => void;
+  private readonly helper: () => string | undefined;
+  private readonly spawnProcess: typeof spawn;
 
   constructor(
-    id: string,
     onActivate: () => void | Promise<void>,
     onError: (error: Error) => void,
-    client: NotifierLike = notifier as unknown as NotifierLike,
-    onEvent?: (response?: string, metadata?: Record<string, unknown>) => void,
+    onEvent?: (result: string) => void,
+    helper: () => string | undefined = () => (helperCommand().native ? nativeHelperPath() : undefined),
+    spawnProcess: typeof spawn = spawn,
   ) {
-    this.id = id;
     this.onActivate = onActivate;
     this.onError = onError;
-    this.client = client;
     this.onEvent = onEvent;
+    this.helper = helper;
+    this.spawnProcess = spawnProcess;
   }
 
-  show(title: string, message: string, appearance: ToastAppearance = {}): void {
-    if (this.closed) return;
-    const generation = ++this.generation;
-    this.client.notify(
-      {
-        title,
-        message,
-        id: this.id,
-        ...(appearance.appID ? { appID: appearance.appID } : {}),
-        ...(appearance.icon ? { icon: appearance.icon } : {}),
-      },
-      (error, response, metadata) => {
-        if (this.closed || generation !== this.generation) return;
-        if (error) {
-          this.onError(error);
-          return;
-        }
-        this.onEvent?.(response, metadata);
-        if (activated(response, metadata)) void this.onActivate();
-      },
-    );
+  show(title: string, message: string, appearance: ToastAppearance & { tag?: string } = {}): boolean {
+    if (this.closed) return false;
+    const exe = this.helper();
+    if (!exe || !appearance.appID) return false;
+    this.close();
+
+    const args = [
+      "-Action", "toast",
+      "-Title", title,
+      "-Message", message,
+      "-AppID", appearance.appID,
+      "-ParentPid", String(process.pid),
+    ];
+    if (appearance.icon) args.push("-Icon", appearance.icon);
+    if (appearance.tag) args.push("-Tag", appearance.tag);
+
+    const child = this.spawnProcess(exe, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    this.child = child;
+    let output = "";
+    child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+    const finish = (): void => {
+      if (this.child === child) this.child = undefined;
+      const result = output.trim() || "unknown";
+      this.onEvent?.(result);
+      if (result === "activated") void this.onActivate();
+    };
+    child.once("close", finish);
+    child.once("error", (error) => {
+      if (this.child === child) this.child = undefined;
+      this.onError(error);
+    });
+    return true;
   }
 
+  /** 关闭当前 toast 的监听进程；系统通知中心里的条目会自行过期。 */
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.generation += 1;
-    // ponytail: node-notifier 的 Windows toaster 不支持 remove（会抛
-    // "Message or ID to close is required."），toast 靠系统自动过期；
-    // 真正需要主动清除时再换 WinRT ToastNotifier.Hide。
+    const child = this.child;
+    this.child = undefined;
+    if (!child) return;
+    child.removeAllListeners("close");
+    child.kill();
   }
 }
+

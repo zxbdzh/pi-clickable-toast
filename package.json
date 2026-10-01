@@ -6,8 +6,5 @@
   "scripts": {
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "smoke:rpc": "node tests/rpc-smoke.mjs"
-  },
-  "dependencies": {
-    "node-notifier": "10.0.1"
   }
 }

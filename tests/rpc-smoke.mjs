@@ -32,51 +32,6 @@ pi.stdout.on("data", (chunk) => {
   }
 });
 
-// SnoreToast 显示后约 5-8s 无交互就 TimedOut 退出（exit code 3），
-// 而 WMI 查询一次要 ~2s，轮询容易错过窗口。直接读 node-notifier 的
-// named pipe 名（进程内固定生成），从发 toast 前就持续监听点击事件。
-
-const WATCH_FILE = path.join(os.tmpdir(), "pi-clickable-toast-smoke-watch.txt");
-
-// 常驻观察进程：每 300ms 扫一次 snoretoast，命中即写文件并退出。
-// 每次同步 execFileSync 的 PowerShell 冷启动约 2s，会错过 SnoreToast 的
-// 存活窗口（无交互 5-8s 后 TimedOut），所以必须在发 toast 前启动观察者。
-function startToastWatcher() {
-  const watchPath = WATCH_FILE.split("\\").join("\\\\");
-  const script = [
-    "$deadline = (Get-Date).AddSeconds(60)",
-    "while ((Get-Date) -lt $deadline) {",
-    "  $hit = Get-CimInstance Win32_Process | Where-Object {",
-    "    $_.Name -like 'snoretoast*' -and $_.CommandLine -like '*pi-clickable-toast-*'",
-    "  } | Select-Object -First 1",
-    "  if ($hit) {",
-    "    Set-Content -LiteralPath '" + watchPath + "' -Value ($hit.ProcessId.ToString() + '|' + $hit.CommandLine) -Encoding utf8",
-    "    exit 0",
-    "  }",
-    "  Start-Sleep -Milliseconds 300",
-    "}",
-    "exit 1",
-  ].join("\n");
-  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  child.unref();
-  try { fs.rmSync(WATCH_FILE, { force: true }); } catch {}
-  return child;
-}
-
-function toastProcesses() {
-  try {
-    const raw = fs.readFileSync(WATCH_FILE, "utf8").trim();
-    if (!raw) return [];
-    const [pid, ...rest] = raw.split("|");
-    return [{ ProcessId: pid, CommandLine: rest.join("|") }];
-  } catch {
-    return [];
-  }
-}
-
 async function waitFor(predicate, label, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -87,6 +42,15 @@ async function waitFor(predicate, label, timeoutMs = 10_000) {
   throw new Error(
     `Timed out waiting for ${label}; exit=${pi.exitCode}; stderr=${stderr}; records=${JSON.stringify(records)}`,
   );
+}
+
+// pi 退出后，等待点击的 helper 进程也应随之结束（否则 pi 崩溃会留下孤儿）。
+function helperProcessCount() {
+  const raw = execFileSync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command",
+    "(Get-Process -Name 'PiToastFocus*' -ErrorAction SilentlyContinue | Measure-Object).Count",
+  ], { encoding: "utf8", windowsHide: true });
+  return Number(String(raw).trim()) || 0;
 }
 
 function activatePipe(pipeName) {
@@ -120,24 +84,21 @@ try {
     throw new Error(`Unexpected RPC response: ${JSON.stringify(response)}`);
   }
 
-  // SnoreToast 显示后把通知转交 Windows 通知平台并立即退出（CIM 查不到进程），
-  // 点击回调经 named pipe 异步到达 node-notifier。进程级等待不可靠，
-  // 这里的端到端断言是：toast 已发送（UI notify 记录）+ pi 优雅退出 +
-  // 无 toast 进程残留。点击协议与 focus 链路由 pipe-probe 与单测覆盖。
   await delay(500);
   pi.stdin.end();
 
   const result = await exit;
   if (result.code !== 0) throw new Error(`Pi exited with ${JSON.stringify(result)}\n${stderr}`);
   await delay(300);
-  const remaining = toastProcesses();
-  if (remaining.length > 0) throw new Error(`Toast process survived shutdown: ${JSON.stringify(remaining)}`);
+
+  const leftovers = helperProcessCount();
+  if (leftovers > 0) throw new Error(leftovers + " toast helper process(es) survived shutdown");
 
   console.log(JSON.stringify({
     rpcDisposition: response.data.disposition,
     toastSent: records.some((r) => r.type === "extension_ui_request" && String(r.message || "").includes("toast sent")),
     piExitCode: result.code,
-    toastProcessesAfterShutdown: remaining.length,
+    helperProcessesAfterShutdown: leftovers,
   }));
 } finally {
   clearTimeout(timeout);

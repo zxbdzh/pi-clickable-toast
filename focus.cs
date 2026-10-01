@@ -11,6 +11,9 @@
 //   herdr-focus 1     raise the Windows Terminal window hosting the Herdr UI and select its tab
 //                     (stdout: "<hwnd> via=<method> tab=<state>", exit 2: no herdr UI window)
 //   icon              draw a rounded-square project icon: -Text <1-2 chars> -Color <RRGGBB> -Out <png path>
+//   toast             show a toast that reports clicks: -Title, -Message, -AppID, [-Icon png], [-Tag t]
+//                     (stdout: activated | dismissed | failed | timeout; stays alive for clicks from the
+//                      notification centre too, exit code 0 only on activated)
 //
 // Must stay C# 5 compatible: it is compiled with the in-box .NET Framework csc.exe.
 
@@ -27,6 +30,8 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Automation;
+using Windows.Data.Xml.Dom;
+using Windows.UI.Notifications;
 
 internal static class Native
 {
@@ -93,6 +98,12 @@ internal static class Program
             opts.TryGetValue("Color", out color);
             opts.TryGetValue("Out", out outPath);
             try { return MakeIcon(text, color, outPath); }
+            catch (Exception ex) { Console.Error.WriteLine("error: " + ex.Message); return 4; }
+        }
+
+        if (action == "toast")
+        {
+            try { return ShowToast(opts); }
             catch (Exception ex) { Console.Error.WriteLine("error: " + ex.Message); return 4; }
         }
 
@@ -167,6 +178,77 @@ internal static class Program
             File.Delete(tmp);
         }
         return 0;
+    }
+
+    // ---- toast: show it and report the click ------------------------------------------------
+
+    private static string XmlEscape(string s)
+    {
+        if (s == null) return "";
+        return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
+    }
+
+    // Windows keeps a toast in the action centre for hours, so a click can arrive long after the banner
+    // disappeared. Stay alive for either event; only a user-close, a dead parent, or a very long deadline
+    // ends the wait.
+    private static int ShowToast(Dictionary<string, string> opts)
+    {
+        string title, message, appId, icon, tag, rawParent;
+        opts.TryGetValue("Title", out title);
+        opts.TryGetValue("Message", out message);
+        opts.TryGetValue("AppID", out appId);
+        opts.TryGetValue("Icon", out icon);
+        opts.TryGetValue("Tag", out tag);
+        opts.TryGetValue("ParentPid", out rawParent);
+        int parentPid = 0;
+        if (!string.IsNullOrEmpty(rawParent)) int.TryParse(rawParent, out parentPid);
+        if (string.IsNullOrEmpty(appId)) return 1;
+
+        string image = string.IsNullOrEmpty(icon)
+            ? ""
+            : "<image placement=\"appLogoOverride\" hint-crop=\"square\" src=\"" + XmlEscape(new Uri(icon).AbsoluteUri) + "\"/>";
+        XmlDocument xml = new XmlDocument();
+        xml.LoadXml(
+            "<toast><visual><binding template=\"ToastGeneric\">" +
+            "<text>" + XmlEscape(title) + "</text>" +
+            "<text>" + XmlEscape(message) + "</text>" +
+            image +
+            "</binding></visual></toast>");
+
+        ToastNotification toast = new ToastNotification(xml);
+        if (!string.IsNullOrEmpty(tag)) toast.Tag = tag;
+        toast.ExpirationTime = DateTimeOffset.Now.AddHours(12);
+
+        ManualResetEventSlim done = new ManualResetEventSlim(false);
+        string result = "timeout";
+        toast.Activated += (s, e) => { result = "activated"; done.Set(); };
+        toast.Dismissed += (s, e) =>
+        {
+            // TimedOut only means the banner left the screen; the notification is still clickable in the
+            // action centre, so keep waiting (this is the common case: the user clicks it later).
+            if (e.Reason == ToastDismissalReason.TimedOut) return;
+            result = "dismissed";
+            done.Set();
+        };
+        toast.Failed += (s, e) => { result = "failed"; done.Set(); };
+
+        ToastNotificationManager.CreateToastNotifier(appId).Show(toast);
+
+        // Wait in slices so a dead parent (pi crashed or was killed) does not leave us behind for hours.
+        DateTime deadline = DateTime.Now.AddHours(12);
+        while (DateTime.Now < deadline)
+        {
+            if (done.Wait(TimeSpan.FromSeconds(20))) break;
+            if (parentPid > 0 && !ProcessExists(parentPid)) { result = "orphan"; break; }
+        }
+        Console.Out.Write(result);
+        return result == "activated" ? 0 : 1;
+    }
+
+    private static bool ProcessExists(int pid)
+    {
+        try { using (Process.GetProcessById(pid)) return true; }
+        catch (ArgumentException) { return false; }
     }
 
     // ---- capture: first ancestor process that owns a top-level window ---------------------------
