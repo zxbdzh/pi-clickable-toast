@@ -5,9 +5,21 @@ import {
   ToastController,
   captureTerminalWindowHandle,
   focusOrigin,
+  withoutHerdrEnv,
   type ExecFileLike,
   type NotifierLike,
 } from "../windows.ts";
+
+test("strips HERDR_* so a spawned attach is not treated as nested herdr", () => {
+  const env = withoutHerdrEnv({
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: "w4:p12",
+    HERDR_SOCKET_PATH: "C:/x/herdr.sock",
+    PATH: "C:/bin",
+    USERPROFILE: "C:/Users/1",
+  });
+  assert.deepEqual(env, { PATH: "C:/bin", USERPROFILE: "C:/Users/1" });
+});
 
 test("uses one notification id and ignores clicks from replaced toasts", async () => {
   const calls: Array<{

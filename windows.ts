@@ -149,9 +149,22 @@ async function isHwndVisible(hwnd: string, run: ExecFileLike): Promise<boolean> 
 
 export type SpawnDetachedLike = (file: string, args: readonly string[]) => void;
 
+/**
+ * 去掉所有 HERDR_* 环境变量。pi 跑在 Herdr pane 里时子进程会继承它们，
+ * herdr 据此判定“嵌套”并拒绝 attach（error: nested herdr is disabled by default）。
+ */
+export function withoutHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !key.toUpperCase().startsWith("HERDR_")));
+}
+
 /** 默认实现：真实开新终端。测试必须注入假实现，否则每跑一次就弹一个窗口。 */
 function systemSpawnDetached(file: string, args: readonly string[]): void {
-  const child = spawn(file, [...args], { stdio: "ignore", detached: true, windowsHide: false });
+  const child = spawn(file, [...args], {
+    stdio: "ignore",
+    detached: true,
+    windowsHide: false,
+    env: withoutHerdrEnv(),
+  });
   child.unref();
 }
 
