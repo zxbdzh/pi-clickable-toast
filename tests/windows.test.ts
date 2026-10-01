@@ -102,7 +102,9 @@ test("opens an attach window only when no herdr terminal can be found", async ()
 
   const result = await focusOrigin(herdrOrigin, run, (file, args) => { spawned.push({ file, args }); });
 
-  assert.deepEqual(result, { ok: true, method: "herdr", attached: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.attached, true);
+  assert.match(result.hostError ?? "", /exit 2/, "failure reason must be surfaced for the debug log");
   assert.deepEqual(spawned, [{ file: "cmd.exe", args: ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"] }]);
 });
 

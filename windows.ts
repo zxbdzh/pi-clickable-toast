@@ -132,6 +132,7 @@ export async function focusOrigin(
     // Herdr 界面是独立的客户端进程，不在 pi 的父进程链上，所以由脚本直接查找它所在的
     // Windows Terminal 窗口（必要时切到对应 tab）并前置，再切 Herdr 内部焦点并标记已看。
     let hostFocused = false;
+    let hostError: string | undefined;
     try {
       const { stdout } = await run(
         POWERSHELL,
@@ -139,8 +140,9 @@ export async function focusOrigin(
         { timeout: 10_000, windowsHide: true, encoding: "utf8" },
       );
       hostFocused = /^[0-9]+$/.test(stdout.trim());
-    } catch {
-      // 找不到界面客户端（Herdr 在后台运行、没有任何终端显示它）→ 走 attach 兜底
+    } catch (error) {
+      // 找不到界面客户端或前台被系统拒绝；记录原因，再走 attach 兜底
+      hostError = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 240);
     }
     try {
       await run("herdr.exe", ["agent", "focus", origin.herdrPaneId], {
@@ -164,6 +166,7 @@ export async function focusOrigin(
         method: "herdr",
         attached: true,
         ...(herdrError ? { degraded: true, error: herdrError } : {}),
+        ...(hostError ? { hostError } : {}),
       };
     } catch (error) {
       const attachError = error instanceof Error ? error.message : String(error);

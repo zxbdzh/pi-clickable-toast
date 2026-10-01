@@ -65,7 +65,7 @@ function loadClickableConfig(): ClickableConfig {
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-01-herdr-client-focus";
+const BUILD_TAG = "2026-10-01-foreground-lock-bypass";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
