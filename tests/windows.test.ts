@@ -47,19 +47,17 @@ test("focuses the exact Herdr pane with stable arguments", async () => {
   };
   const origin: Origin = { cwd: "C:/work/demo", project: "demo", herdrPaneId: "w4:p12", hwnd: "99" };
 
+  const spawned: Array<{ file: string; args: readonly string[] }> = [];
+  const fakeSpawn = (file: string, args: readonly string[]) => { spawned.push({ file, args }); };
+
   // ConPTY 不可见（最常见）→ focus 后新 tab attach 兜底
-  assert.deepEqual(await focusOrigin(origin, run), {
-    ok: true,
-    method: "herdr",
-    attached: true,
-  });
+  const result = await focusOrigin(origin, run, fakeSpawn);
+  assert.deepEqual(result, { ok: true, method: "herdr", attached: true });
   assert.equal(calls[0].file, "powershell.exe"); // 前置
   assert.deepEqual(calls[0].args.slice(-4), ["-Action", "focus", "-Value", "99"]);
   assert.equal(calls[1].file, "powershell.exe"); // visible 查询
   assert.deepEqual(calls[2], { file: "herdr.exe", args: ["agent", "focus", "w4:p12"] });
-  const attachCall = calls.find((c) => c.file === "cmd.exe");
-  assert.ok(attachCall, "invisible ConPTY should trigger attach");
-  assert.deepEqual(attachCall.args, ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"]);
+  assert.deepEqual(spawned, [{ file: "cmd.exe", args: ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"] }]);
 });
 
 test("attaches a new tab when Herdr focus fails even if visible", async () => {
@@ -72,15 +70,14 @@ test("attaches a new tab when Herdr focus fails even if visible", async () => {
   };
   const origin: Origin = { cwd: "C:/work/demo", project: "demo", herdrPaneId: "w4:p12", hwnd: "1234" };
 
-  const result = await focusOrigin(origin, run);
+  const spawned: Array<{ file: string; args: readonly string[] }> = [];
+  const result = await focusOrigin(origin, run, (file, args) => { spawned.push({ file, args }); });
   assert.equal(result.ok, true);
   assert.equal(result.method, "herdr");
   assert.equal(result.attached, true); // focus 失败也走 attach 兑底
   assert.equal(calls[0].file, "powershell.exe"); // 前置尝试
   assert.equal(calls[2].file, "herdr.exe"); // agent focus（失败，[1] 是 visible 查询）
-  const attachCall = calls.find((c) => c.file === "cmd.exe");
-  assert.ok(attachCall, "should attach when herdr focus fails");
-  assert.deepEqual(attachCall.args, ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"]);
+  assert.equal(spawned.length, 1);
 });
 
 test("skips attach when the herdr tab is already visible", async () => {
@@ -92,8 +89,9 @@ test("skips attach when the herdr tab is already visible", async () => {
   };
   const origin: Origin = { cwd: "C:/work/demo", project: "demo", herdrPaneId: "w4:p12", hwnd: "99" };
 
-  assert.deepEqual(await focusOrigin(origin, run), { ok: true, method: "herdr" });
-  assert.equal(calls.find((c) => c.file === "cmd.exe"), undefined);
+  const spawned: unknown[] = [];
+  assert.deepEqual(await focusOrigin(origin, run, () => { spawned.push(1); }), { ok: true, method: "herdr" });
+  assert.equal(spawned.length, 0);
 });
 
 test("captures a numeric ancestor window handle", async () => {

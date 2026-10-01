@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import notifier from "node-notifier";
 import type { Origin } from "./core.ts";
@@ -147,9 +147,18 @@ async function isHwndVisible(hwnd: string, run: ExecFileLike): Promise<boolean> 
   }
 }
 
+export type SpawnDetachedLike = (file: string, args: readonly string[]) => void;
+
+/** 默认实现：真实开新终端。测试必须注入假实现，否则每跑一次就弹一个窗口。 */
+function systemSpawnDetached(file: string, args: readonly string[]): void {
+  const child = spawn(file, [...args], { stdio: "ignore", detached: true, windowsHide: false });
+  child.unref();
+}
+
 export async function focusOrigin(
   origin: Origin,
   run: ExecFileLike = systemExecFile,
+  spawnDetached: SpawnDetachedLike = systemSpawnDetached,
 ): Promise<FocusResult> {
   let herdrError: string | undefined;
   if (origin.herdrPaneId) {
@@ -185,13 +194,11 @@ export async function focusOrigin(
     if (herdrError === undefined && herdrVisible) {
       return { ok: true, method: "herdr" };
     }
-    // 不可见或 focus 失败：新开 tab attach 常驻 session（WT 会前台新 tab 并显示 TUI）
+    // 不可见或 focus 失败：新开 tab attach 常驻 session（WT 会前台新 tab 并显示 TUI）。
+    // ponytail: 必须用 spawn detached 而非 execFile —— start 打开的 cmd /k 是常驻进程，
+    // execFile 等它退出会永远阻塞（5s 超时后报错，点击看起来就是“没反应”）。
     try {
-      await run("cmd.exe", ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"], {
-        timeout: 5_000,
-        windowsHide: false,
-        encoding: "utf8",
-      });
+      spawnDetached("cmd.exe", ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"]);
       return {
         ok: true,
         method: "herdr",
