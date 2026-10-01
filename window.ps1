@@ -3,7 +3,7 @@
   [Int64]$Value
 )
 
-if ($Action -notin @("capture", "focus", "foreground", "console") -or $Value -lt 1) {
+if ($Action -notin @("capture", "focus", "foreground", "console", "visible") -or $Value -lt 1) {
   exit 1
 }
 
@@ -64,7 +64,8 @@ if ($Action -eq "capture") {
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
-public static class PiClickableToastWin32 {
+public static class PiClickableToastWin32v2 {
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
@@ -77,8 +78,8 @@ public static class PiClickableToastWin32 {
 $hwnd = [IntPtr]$Value
 if ($hwnd -eq [IntPtr]::Zero) { exit 2 }
 
-if ($Action -eq "foreground") {
-  if ([PiClickableToastWin32]::GetForegroundWindow() -eq $hwnd) {
+if ($Action -eq "visible") {
+  if ([PiClickableToastWin32v2]::IsWindowVisible($hwnd)) {
     Write-Output "True"
   } else {
     Write-Output "False"
@@ -86,16 +87,25 @@ if ($Action -eq "foreground") {
   exit 0
 }
 
-if ([PiClickableToastWin32]::IsIconic($hwnd)) {
-  [void][PiClickableToastWin32]::ShowWindowAsync($hwnd, 9)
+if ($Action -eq "foreground") {
+  if ([PiClickableToastWin32v2]::GetForegroundWindow() -eq $hwnd) {
+    Write-Output "True"
+  } else {
+    Write-Output "False"
+  }
+  exit 0
+}
+
+if ([PiClickableToastWin32v2]::IsIconic($hwnd)) {
+  [void][PiClickableToastWin32v2]::ShowWindowAsync($hwnd, 9)
 }
 
 [uint32]$ownerPid = 0
-[void][PiClickableToastWin32]::GetWindowThreadProcessId($hwnd, [ref]$ownerPid)
+[void][PiClickableToastWin32v2]::GetWindowThreadProcessId($hwnd, [ref]$ownerPid)
 if ($ownerPid -gt 0) {
   try { [void](New-Object -ComObject WScript.Shell).AppActivate([int]$ownerPid) } catch {}
 }
-[void][PiClickableToastWin32]::BringWindowToTop($hwnd)
-$focused = [PiClickableToastWin32]::SetForegroundWindow($hwnd)
-if ($focused -or [PiClickableToastWin32]::GetForegroundWindow() -eq $hwnd) { exit 0 }
+[void][PiClickableToastWin32v2]::BringWindowToTop($hwnd)
+$focused = [PiClickableToastWin32v2]::SetForegroundWindow($hwnd)
+if ($focused -or [PiClickableToastWin32v2]::GetForegroundWindow() -eq $hwnd) { exit 0 }
 exit 3

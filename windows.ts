@@ -129,7 +129,22 @@ export interface FocusResult {
   ok: boolean;
   method?: "herdr" | "window";
   degraded?: boolean;
+  attached?: boolean;
   error?: string;
+}
+
+/** ConPTY 顶层窗口通常 invisible；只有它所属 tab 被显示时才 visible。 */
+async function isHwndVisible(hwnd: string, run: ExecFileLike): Promise<boolean> {
+  try {
+    const { stdout } = await run(
+      POWERSHELL,
+      [...POWERSHELL_ARGS, "-Action", "visible", "-Value", hwnd],
+      { timeout: 5_000, windowsHide: true, encoding: "utf8" },
+    );
+    return stdout.trim() === "True";
+  } catch {
+    return false;
+  }
 }
 
 export async function focusOrigin(
@@ -138,10 +153,10 @@ export async function focusOrigin(
 ): Promise<FocusResult> {
   let herdrError: string | undefined;
   if (origin.herdrPaneId) {
-    // 先前置宿主终端（ConPTY owner 即 WT 主窗口，能把窗口提到前台），
-    // 再切 Herdr 内部焦点并标记已看。宿主可能是隐藏的 detached TUI：
-    // 此时 owner 前置后用户看到的仍不是 herdr，因此再开一个新 tab attach
-    // 兜底，保证点击后 herdr TUI 一定可见。
+    // 先前置宿主终端，再切 Herdr 内部焦点并标记已看。
+    // ConPTY 顶层窗口通常 invisible；只有它所属 tab 被显示时才 visible。
+    // herdr agent focus 成功不代表用户看得到（detached TUI / tab 未聚焦），
+    // 因此 ConPTY 不可见时追加新 tab attach 兜底，保证 herdr TUI 一定出现在屏幕上。
     if (!origin.hwnd) {
       try {
         origin.hwnd = await captureHerdrHostHandle(run);
@@ -149,9 +164,11 @@ export async function focusOrigin(
         // fall through to herdr-only focus
       }
     }
+    let herdrVisible = false;
     if (origin.hwnd) {
       try {
         await focusWindow(origin.hwnd, run);
+        herdrVisible = await isHwndVisible(origin.hwnd, run);
       } catch {
         // Host window focus is best-effort; herdr focus still marks seen.
       }
@@ -162,19 +179,25 @@ export async function focusOrigin(
         windowsHide: true,
         encoding: "utf8",
       });
-      return { ok: true, method: "herdr" };
     } catch (error) {
       herdrError = error instanceof Error ? error.message : String(error);
     }
-    // herdr agent focus 成功不保证 TUI 可见（detached TUI 或 tab 不在当前窗口）。
-    // 新开一个 tab attach 常驻 session，确保用户一定能看到 herdr。
+    if (herdrError === undefined && herdrVisible) {
+      return { ok: true, method: "herdr" };
+    }
+    // 不可见或 focus 失败：新开 tab attach 常驻 session（WT 会前台新 tab 并显示 TUI）
     try {
       await run("cmd.exe", ["/c", "start", "", "cmd.exe", "/k", "herdr", "session", "attach", "default"], {
         timeout: 5_000,
         windowsHide: false,
         encoding: "utf8",
       });
-      return { ok: true, method: "herdr" };
+      return {
+        ok: true,
+        method: "herdr",
+        attached: true,
+        ...(herdrError ? { degraded: true, error: herdrError } : {}),
+      };
     } catch (error) {
       const attachError = error instanceof Error ? error.message : String(error);
       return { ok: false, error: [herdrError, attachError].filter(Boolean).join("; ") };
