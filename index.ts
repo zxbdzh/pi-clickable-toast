@@ -74,7 +74,7 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-01-winrt-toast";
+const BUILD_TAG = "2026-10-06-tui-only";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -282,8 +282,14 @@ export default function clickableToast(pi: ExtensionAPI): void {
     reported.clear();
     pendingManual.clear();
     disarmRenotify();
+    // 只有交互终端会话自动发通知。magic-context 等扩展会在后台起 `pi --mode json/rpc` 子进程，
+    // 子进程同样加载本扩展：它的 agent_end 不是用户的 agent 结束，而且跑完即退出，toast 点了也没人接。
+    if (ctx.mode !== "tui") {
+      debugLog(`session_start: build=${BUILD_TAG} mode=${ctx.mode} cwd=${ctx.cwd} -> automatic toasts off`);
+      return;
+    }
     origin = createOrigin(ctx.cwd);
-    debugLog(`session_start: build=${BUILD_TAG} herdrPane=${origin.herdrPaneId ?? "-"} cwd=${ctx.cwd}`);
+    debugLog(`session_start: build=${BUILD_TAG} mode=${ctx.mode} herdrPane=${origin.herdrPaneId ?? "-"} cwd=${ctx.cwd}`);
     // 后台编译原生辅助程序（仅首次，约 0.7 秒）；就绪前发的 toast 会被跳过并提示。
     controller = new NativeToast(activateOrigin, (error) => reportOnce("toast", error.message), onToastEvent);
     void buildNativeHelper().then((ok) => {

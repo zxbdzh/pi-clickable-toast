@@ -10,6 +10,7 @@
   - 普通 Windows Terminal → PowerShell 沿父进程链捕获 `MainWindowHandle`，点击时恢复/前置窗口（窗口级）
 - **每会话仅最新一条**：新 toast 顶替旧的，不堆叠
 - **会话退出清理**：`session_shutdown` 幂等清理控制器
+- **只在交互终端里自动通知**：magic-context 等扩展会在后台起 `pi --mode json/rpc` 子进程，它们也加载本扩展；这些进程不发自动通知（否则会弹出不属于你的 “Agent Run Complete”，且子进程退出后点了没反应）
 - **来源标识**：toast 正文末尾追加 `项目名 · pane xxx` / `项目名 · WT xxxxxxxx`
 
 ## 安装
