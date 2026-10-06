@@ -9,6 +9,7 @@ import {
   manualRequestUsesNative,
   normalizeClickableConfig,
   normalizeNotifyConfig,
+  runOutcome,
   shouldSilenceNative,
   sourceLine,
 } from "../core.ts";
@@ -65,6 +66,59 @@ test("builds known event text without importing notify internals", () => {
     }).message,
     "Agent asks: Choose? — A, B",
   );
+});
+
+test("run outcome follows pi's stopReason and picks a readable one-liner", () => {
+  // 一次运行：中间有工具调用，只看最后一条 assistant 回复
+  const run = (stopReason: string, extra: object = {}) => [
+    { role: "user", content: "hi" },
+    { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "earlier step" }] },
+    { role: "toolResult", content: [] },
+    { role: "assistant", stopReason, ...extra },
+  ];
+  assert.deepEqual(
+    runOutcome(run("stop", { content: [{ type: "thinking", thinking: "x" }, { type: "text", text: "\n## **已修复这个 403。**\n\n细节" }] })),
+    { status: "completed", detail: "已修复这个 403。" },
+  );
+  assert.deepEqual(runOutcome(run("stop", { content: [] })), { status: "completed" });
+  assert.equal(runOutcome(run("stop", { content: [{ type: "text", text: "x".repeat(500) }] })).detail?.length, 200);
+  assert.deepEqual(runOutcome(run("aborted")), { status: "aborted" });
+  // 工具执行中按 Esc：后续请求立刻失败，记成 error「This operation was aborted」，也算中断
+  assert.deepEqual(runOutcome(run("error", { errorMessage: "This operation was aborted" })), { status: "aborted" });
+  assert.deepEqual(runOutcome(run("error", { errorMessage: "Request was aborted." })), { status: "aborted" });
+  // 工具主动结束本轮：toolUse 那条的开场白不当正文
+  assert.deepEqual(runOutcome(run("toolUse", { content: [{ type: "text", text: "我先看看日志" }] })), { status: "completed" });
+  assert.deepEqual(
+    runOutcome(run("error", { errorMessage: '503 {"error":{"message":"No available accounts: no available accounts","type":"api_error"}' })),
+    { status: "error", detail: "503 No available accounts: no available accounts" },
+  );
+  assert.deepEqual(runOutcome(run("error", { errorMessage: "Connection error." })), { status: "error", detail: "Connection error." });
+  assert.deepEqual(runOutcome(run("error")), { status: "error" });
+  assert.deepEqual(runOutcome(undefined), { status: "completed" });
+});
+
+test("completion notification title and body follow the run outcome", () => {
+  assert.deepEqual(buildEventNotification("agent_settled", { status: "completed", detail: "已修复这个 403。" }, "demo"), {
+    title: "Pi — Agent Complete",
+    message: "demo - 已修复这个 403。",
+  });
+  assert.deepEqual(buildEventNotification("agent_settled", { status: "error", detail: "503 No available accounts" }), {
+    title: "Pi — Agent Failed",
+    message: "503 No available accounts",
+  });
+  assert.deepEqual(buildEventNotification("agent_settled", { status: "error" }), {
+    title: "Pi — Agent Failed",
+    message: "Agent stopped with an error",
+  });
+  assert.deepEqual(buildEventNotification("agent_settled", { status: "aborted" }, "demo"), {
+    title: "Pi — Agent Stopped",
+    message: "demo - Agent stopped before finishing",
+  });
+  // agent_end 之前没收到（拿不到结果）时保持原来的文字
+  assert.deepEqual(buildEventNotification("agent_settled", undefined), {
+    title: "Pi — Agent Complete",
+    message: "Agent is complete",
+  });
 });
 
 test("source line shows only the project name, never pane or terminal session ids", () => {

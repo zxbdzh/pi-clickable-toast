@@ -217,6 +217,45 @@ function permissionMessage(payload: unknown): string {
   return parts.join(" ");
 }
 
+/** 一次 agent 运行的结果，和 pi 自己一样按最后一条回复的 stopReason 判定；detail 是通知正文用的一句话。 */
+export interface RunOutcome {
+  status: "completed" | "error" | "aborted";
+  detail?: string;
+}
+
+/** 第一行非空文字：去掉 markdown 加粗和标题/引用前缀；过长截断（toast 本来也显示不下，还能避免命令行过长）。 */
+function firstLine(value: string, max = 200): string | undefined {
+  const line = value
+    .split("\n")
+    .map((item) => item.replace(/\*\*|^\s*(#{1,6}\s+|>\s*)/g, "").trim())
+    .find(Boolean);
+  if (!line) return undefined;
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
+/** fetch 的 AbortError、OpenAI SDK、pi 代理被中断时的报错文字。 */
+const ABORTED_ERROR = /\b(operation|request) (was )?aborted\b/i;
+
+export function runOutcome(messages: unknown): RunOutcome {
+  const assistants = (Array.isArray(messages) ? messages.map(record) : []).filter((message) => message.role === "assistant");
+  const last = assistants.at(-1) ?? {};
+  // 在工具执行中途中断时，agent 还会带着已中断的信号再发一次请求，请求立刻失败，常记成
+  // error「This operation was aborted」而不是 aborted（真实会话里这类报错都紧跟在工具结果之后），按中断算
+  if (last.stopReason === "aborted" || (last.stopReason === "error" && ABORTED_ERROR.test(String(last.errorMessage ?? "")))) {
+    return { status: "aborted" };
+  }
+  if (last.stopReason === "error") {
+    // 报错常带一段 JSON（如 502 {"error":{"message":"..."}}），换成里面的 message，toast 里一眼能看懂
+    const detail = firstLine(String(last.errorMessage ?? "").replace(/\{[\s\S]*?"message"\s*:\s*"([^"]*)"[\s\S]*$/, "$1"));
+    return { status: "error", ...(detail ? { detail } : {}) };
+  }
+  // 以 toolUse 收尾说明是工具主动结束了本轮，那段文字多是“我先看看…”这类开场白，不当正文
+  if (last.stopReason === "toolUse") return { status: "completed" };
+  const parts = Array.isArray(last.content) ? last.content.map(record) : [];
+  const detail = firstLine(parts.filter((part) => part.type === "text").map((part) => String(part.text ?? "")).join("\n"));
+  return { status: "completed", ...(detail ? { detail } : {}) };
+}
+
 const LABELS: Record<KnownEvent, string> = {
   workflow_end: "Workflow Done",
   ralph_loop_end: "Ralph Complete",
@@ -235,6 +274,7 @@ export function buildEventNotification(
 ): { title: string; message: string } {
   const p = record(payload);
   let message: string;
+  let label = LABELS[eventKey];
   switch (eventKey) {
     case "workflow_end":
       message = `Workflow ${String(p.command || "unknown")}${p.success === false ? " failed" : " completed"}`;
@@ -246,11 +286,15 @@ export function buildEventNotification(
       message = `Server "${String(p.name || "unknown")}" error: ${String(p.error || "unknown error")}`;
       break;
     case "agent_end":
-      message = sessionName ? `${sessionName} - Agent run is complete` : "Agent run is complete";
+    case "agent_settled": {
+      // payload 是 runOutcome() 的结果：报错和被中断换标题；正文优先用回复首句或报错原因
+      let fallback = eventKey === "agent_end" ? "Agent run is complete" : "Agent is complete";
+      if (p.status === "error") [label, fallback] = ["Agent Failed", "Agent stopped with an error"];
+      if (p.status === "aborted") [label, fallback] = ["Agent Stopped", "Agent stopped before finishing"];
+      const body = text(p.detail) ?? fallback;
+      message = sessionName ? `${sessionName} - ${body}` : body;
       break;
-    case "agent_settled":
-      message = sessionName ? `${sessionName} - Agent is complete` : "Agent is complete";
-      break;
+    }
     case "memory_consolidated":
       message = `Memory consolidated (${String(p.count || 0)} items)`;
       break;
@@ -261,7 +305,7 @@ export function buildEventNotification(
       message = permissionMessage(payload);
       break;
   }
-  return { title: `Pi — ${LABELS[eventKey]}`, message };
+  return { title: `Pi — ${label}`, message };
 }
 
 export interface Origin {

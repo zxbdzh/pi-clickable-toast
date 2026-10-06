@@ -12,8 +12,9 @@
 - **会话结束即撤通知**：pi 退出、`/reload`、崩溃或终端被关后，它留在通知中心的那条 toast 会被撤掉（这时已没有进程接收点击，留着点了也没反应）。原理：pi 把辅助程序的 stdin 当生命线，会话一结束管道就断，辅助程序收到 EOF 后撤下自己显示的 toast 再退出；辅助程序以 detached 方式启动，否则 pi 一退出它就被 Node 的 job 一起杀掉，来不及撤
 - **只在交互终端里自动通知**：magic-context 等扩展会在后台起 `pi --mode json/rpc` 子进程，它们也加载本扩展；这些进程不发自动通知（否则会弹出不属于你的 “Agent Run Complete”，且子进程退出后点了没反应）
 - **后台任务没跑完不算完成**：agent 用 `bg_run` 等起了跑完会唤醒它的后台任务、自己先结束这一轮时，不弹「Agent Complete」；任务跑完、agent 真正结束时才弹（通过 pi-background-tasks 的 EventBus `status` 查询，没装该扩展时照常弹）
+- **完成通知分清结果**：和 pi 自己一样按最后一条回复的 `stopReason` 判定——正常结束弹「Agent Complete」，正文是回复的第一行；报错弹「Agent Failed」，正文是报错原因（`502 {"error":{"message":…}}` 这类只留 message）；被中断时，10 秒内终端有按键（你按了 Esc）就不弹，没人按键的中断（比如 magic-context 拒绝本轮）弹「Agent Stopped」。工具跑到一半被中断时，pi 常把它记成 `error: This operation was aborted`，这种也按中断处理，不报失败
 - **答完不再催**：提问通知的重复提醒（renotify）在终端有按键（比如回答了问题）时立即取消
-- **来源标识**：toast 正文末尾追加 `项目名 · pane xxx` / `项目名 · WT xxxxxxxx`
+- **来源标识**：`showSource: true` 时 toast 正文末尾追加项目名
 
 ## 安装
 

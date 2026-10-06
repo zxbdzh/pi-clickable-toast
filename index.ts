@@ -17,12 +17,14 @@ import {
   manualRequestUsesNative,
   normalizeClickableConfig,
   normalizeNotifyConfig,
+  runOutcome,
   shouldSilenceNative,
   type ClickableConfig,
   type KnownEvent,
   type NotifyConfig,
   type Origin,
   type Platform,
+  type RunOutcome,
 } from "./core.ts";
 import {
   DEFAULT_ICON,
@@ -74,7 +76,7 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-06-native-only";
+const BUILD_TAG = "2026-10-06-run-outcome";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -97,6 +99,10 @@ export default function clickableToast(pi: ExtensionAPI): void {
   let controller: NativeToast | undefined;
   let nativeToastReady = false;
   let lastInputAt = 0;
+  // 最近一次终端按键的时间：判断中断是不是用户自己按 Esc 停的
+  let lastKeyAt = 0;
+  // 最近一次 agent_end 算出的运行结果，agent_settled 时按它决定通知内容
+  let lastRun: RunOutcome | undefined;
   let renotifyTimer: ReturnType<typeof setInterval> | undefined;
   let busUnsubscribers: Array<() => void> = [];
   let unsubTerminalInput: (() => void) | undefined;
@@ -236,9 +242,16 @@ export default function clickableToast(pi: ExtensionAPI): void {
   const handleAutomatic = async (eventKey: KnownEvent, payload: unknown): Promise<void> => {
     const loaded = readConfig();
     if (!loaded?.clickable.enabled || !autoEventUsesNative(loaded.notify, eventKey)) return;
-    if ((eventKey === "agent_end" || eventKey === "agent_settled") && await hasPendingWakeTask(pi.events)) {
-      debugLog(`skip: ${eventKey}, a background task will wake the agent`);
-      return;
+    if (eventKey === "agent_end" || eventKey === "agent_settled") {
+      // 按 Esc 停下时人就在终端前，不用提醒；没人按键的中断（如 magic-context 拒绝本轮）照常提示
+      if ((payload as RunOutcome | undefined)?.status === "aborted" && Date.now() - lastKeyAt < 10_000) {
+        debugLog(`skip: ${eventKey}, stopped by the user`);
+        return;
+      }
+      if (await hasPendingWakeTask(pi.events)) {
+        debugLog(`skip: ${eventKey}, a background task will wake the agent`);
+        return;
+      }
     }
 
     const notification = buildEventNotification(eventKey, payload, pi.getSessionName?.());
@@ -269,6 +282,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     context = ctx;
     lastInputAt = 0;
+    lastKeyAt = 0;
+    lastRun = undefined;
     reported.clear();
     pendingManual.clear();
     disarmRenotify();
@@ -295,6 +310,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
     // 终端里有按键（比如回答了提问）说明人就在跟前，取消“还在等你”的重复提醒。
     // 回答提问不会触发 agent_start，不在这里取消的话，问题答完后重复提醒还会接着弹。
     unsubTerminalInput = ctx.ui.onTerminalInput(() => {
+      lastKeyAt = Date.now();
       if (renotifyTimer !== undefined) {
         debugLog("renotify: cancelled by terminal input");
         disarmRenotify();
@@ -319,9 +335,16 @@ export default function clickableToast(pi: ExtensionAPI): void {
     void refreshWindowHandle();
   });
 
-  pi.on("agent_start", () => disarmRenotify());
-  pi.on("agent_end", (event) => void handleAutomatic("agent_end", event));
-  pi.on("agent_settled", (event) => void handleAutomatic("agent_settled", event));
+  pi.on("agent_start", () => {
+    disarmRenotify();
+    lastRun = undefined;
+  });
+  pi.on("agent_end", (event) => {
+    lastRun = runOutcome(event.messages);
+    void handleAutomatic("agent_end", lastRun);
+  });
+  // 自动重试、压缩续跑都结束后才触发，这时最近一次 agent_end 的结果就是最终结果
+  pi.on("agent_settled", () => void handleAutomatic("agent_settled", lastRun));
 
   pi.on("tool_call", (event: ToolCallEvent) => {
     if (event.toolName !== "notify_user") return;
