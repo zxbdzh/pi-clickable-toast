@@ -1,11 +1,12 @@
 import { execFileSync, spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
-const extension = "C:/Users/1/.pi/agent/extensions/clickable-toast/index.ts";
+const extension = new URL("../index.ts", import.meta.url).href;
+const cliDefault = "D:/env/nvm/v22.22.0/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
 const pi = spawn(
-  "D:/nvm4w/nodejs/node.exe",
+  process.execPath,
   [
-    "D:/nvm4w/nodejs/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+    process.env.PI_CLI || cliDefault,
     "--mode", "rpc", "--no-session", "--no-extensions", "--extension", extension,
   ],
   { stdio: ["pipe", "pipe", "pipe"], windowsHide: true },

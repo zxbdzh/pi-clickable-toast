@@ -3,6 +3,12 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "scripts": {
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "smoke:rpc": "node tests/rpc-smoke.mjs"

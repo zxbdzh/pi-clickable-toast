@@ -17,12 +17,13 @@
 
 ## 安装
 
-```powershell
-# 复制到 pi 扩展目录
-xcopy /E /I pi-clickable-toast "%USERPROFILE%\.pi\agent\extensions\clickable-toast"
+```bash
+pi install F:\github\pi-clickable-toast   # 本地路径安装，原地加载，不复制
 ```
 
-无运行时依赖，不需要 `npm install`：toast 和窗口定位都由 `focus.cs` 编译出的原生 exe 完成（见下）。
+`package.json` 里的 `pi.extensions` 指向 `./index.ts`。本地包按解析出的绝对路径识别，所以**不要同时**把它拷到 `%USERPROFILE%\.pi\agent\extensions\clickable-toast` —— 那样会被当成两个包各加载一次，每条通知弹两张。
+
+无运行时依赖，也不需要 `npm install`：toast 和窗口定位都由 `focus.cs` 编译出的原生 exe 完成（见下）。`@earendil-works/pi-coding-agent` 只在 `peerDependencies` 里声明，由 pi 本身提供，实际用到的是类型导入。
 
 ## 配置
 
@@ -83,7 +84,7 @@ npm test          # 单元测试（core/windows 逻辑）
 npm run smoke:rpc # 端到端冒烟：spawn RPC 模式 pi → 发测试 toast → 退出 pi → 验证辅助程序已退出、通知已从通知中心撤掉
 ```
 
-冒烟脚本要求 Windows + PowerShell（用 CIM 查辅助程序进程、用 WinRT 查通知中心），pi 与扩展路径写死在脚本开头，换机器要改。
+冒烟脚本要求 Windows + PowerShell（用 CIM 查辅助程序进程、用 WinRT 查通知中心）。扩展路径按脚本自身位置解析，pi 的 CLI 路径默认取 `PI_CLI` 环境变量、再用内置默认值，换机器可能要改默认值。
 
 ## 已知限制
 
