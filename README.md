@@ -90,7 +90,7 @@ npm run smoke:rpc # 端到端冒烟：spawn RPC 模式 pi → 触发 toast → �
 - Windows Terminal 只能恢复到窗口级，不定位到具体 tab/pane（WT 无公开的反查 API）
 - 通知中心里的旧通知靠系统自行过期（12 小时），扩展不会主动清理别的会话的通知
 - 点击回调依赖 pi 进程存活（helper 常驻等待系统事件）；pi 退出后通知中心里的条目不再可点
-- 需要 Windows SDK 的 `Windows.winmd` 才能编译 toast 支持；缺失时 toast 不显示并在 pi 里提示一次
+- 编译 toast 支持需要 WinRT 元数据：优先用系统自带的 `C:\Windows\System32\WinMetadata`（Windows 10/11 都有，免装 SDK），其次 Windows SDK 的 `Windows.winmd`；都找不到时 toast 不显示并在 pi 里提示一次
 
 ## License
 

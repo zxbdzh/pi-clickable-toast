@@ -9,6 +9,7 @@ import {
   NativeToast,
   buildNativeHelper,
   captureTerminalWindowHandle,
+  findWinmdRefs,
   ensureProjectIcon,
   focusOrigin,
   helperCommand,
@@ -299,4 +300,25 @@ test("captures a numeric ancestor window handle", async () => {
     ["-Value", "42"],
     ["-Value", "41"],
   ]);
+});
+
+test("findWinmdRefs prefers system WinMetadata and falls back to the SDK merged winmd", () => {
+  const systemDir = join(process.env.windir ?? "C:\\Windows", "System32", "WinMetadata");
+  // 系统自带目录存在 → 全量 winmd（过滤非 winmd、排序），不再看 SDK
+  const systemRefs = findWinmdRefs(
+    (path) => path === systemDir || path === "C:\\Program Files (x86)\\Windows Kits\\10\\UnionMetadata",
+    (dir) => (dir === systemDir ? ["Windows.UI.winmd", "readme.txt", "Windows.Data.winmd"] : ["Facade"]),
+  );
+  assert.deepEqual(systemRefs, [join(systemDir, "Windows.Data.winmd"), join(systemDir, "Windows.UI.winmd")]);
+
+  // 系统目录缺失 → 回退 SDK 合并 winmd（Facade 纯转发被版本号过滤跳过）
+  const sdkRoot = "C:\\Program Files (x86)\\Windows Kits\\10\\UnionMetadata";
+  const sdkOnly = findWinmdRefs(
+    (path) => path === sdkRoot || path === join(sdkRoot, "10.0.26100.0", "Windows.winmd"),
+    (dir) => (dir === sdkRoot ? ["Facade", "10.0.26100.0"] : []),
+  );
+  assert.deepEqual(sdkOnly, [join(sdkRoot, "10.0.26100.0", "Windows.winmd")]);
+
+  // 两边都没有 → 空数组（focus.cs 编译失败，toast 不可用）
+  assert.deepEqual(findWinmdRefs(() => false, () => []), []);
 });

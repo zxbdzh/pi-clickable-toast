@@ -101,6 +101,32 @@ export function findWinmd(exists: (path: string) => boolean = existsSync, read: 
   return undefined;
 }
 
+/** Windows 10/11 系统自带的 WinRT 运行时元数据（分文件版），免装 SDK。 */
+const SYSTEM_WINMD_DIR = join(process.env.windir ?? "C:\\Windows", "System32", "WinMetadata");
+
+/**
+ * WinRT 元数据引用，按优先级：
+ * 1. 系统自带 System32\WinMetadata\*.winmd（Windows 10/11 都有，无需 SDK）；
+ * 2. SDK UnionMetadata\<版本>\Windows.winmd（合并版，仅装了 SDK 的机器才有）。
+ * 部分机器 SDK 目录只剩 Facade\Windows.WinMD（纯类型转发，引用会报 CS1070），
+ * findWinmd 的版本号过滤本来就跳过它，此时回退到系统自带目录。
+ */
+export function findWinmdRefs(exists: (path: string) => boolean = existsSync, read: (dir: string) => string[] = (dir) => readdirSync(dir)): string[] {
+  if (exists(SYSTEM_WINMD_DIR)) {
+    try {
+      const refs = read(SYSTEM_WINMD_DIR)
+        .filter((name) => name.toLowerCase().endsWith(".winmd"))
+        .sort()
+        .map((name) => join(SYSTEM_WINMD_DIR, name));
+      if (refs.length > 0) return refs;
+    } catch {
+      // 目录不可读就落回 SDK 候选
+    }
+  }
+  const sdk = findWinmd(exists, read);
+  return sdk ? [sdk] : [];
+}
+
 let buildInFlight: Promise<boolean> | undefined;
 
 /** 后台编译 focus.cs；成功后 helperCommand 自动改用 exe。失败则一直走 PowerShell 版。 */
@@ -115,7 +141,7 @@ export function buildNativeHelper(): Promise<boolean> {
       .find((dir) => existsSync(join(dir, "csc.exe")));
     if (!framework) return false;
     const wpf = join(framework, "WPF");
-    const winmd = findWinmd();
+    const winmdRefs = findWinmdRefs();
     const tmp = `${exe}.${process.pid}.tmp`;
     try {
       mkdirSync(join(tmpdir(), "pi-clickable-toast"), { recursive: true });
@@ -125,9 +151,9 @@ export function buildNativeHelper(): Promise<boolean> {
         join(wpf, "UIAutomationTypes.dll"),
         join(wpf, "WindowsBase.dll"),
       ];
-      // WinRT (toast) 只在 Windows SDK 存在时才能编译；缺了就退化成没有自定义外观的 SnoreToast 路径。
-      if (winmd) {
-        references.push(winmd, join(framework, "System.Runtime.dll"), join(framework, "System.Runtime.WindowsRuntime.dll"), join(framework, "System.Runtime.InteropServices.WindowsRuntime.dll"));
+      // WinRT (toast) 元数据：优先系统自带 System32\WinMetadata（免 SDK），其次 SDK 合并 winmd；都没有则 focus.cs 编译失败：toast 不可用，窗口定位回退到 window.ps1。
+      if (winmdRefs.length > 0) {
+        references.push(...winmdRefs, join(framework, "System.Runtime.dll"), join(framework, "System.Runtime.WindowsRuntime.dll"), join(framework, "System.Runtime.InteropServices.WindowsRuntime.dll"));
       }
       await systemExecFile(
         join(framework, "csc.exe"),
