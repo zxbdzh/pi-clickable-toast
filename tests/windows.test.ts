@@ -144,7 +144,7 @@ test("passes identity, icon and tag to the native toast helper", () => {
   assert.equal(spawned[0].file, "X:/fake/PiToastFocus.exe");
   assert.deepEqual(spawned[0].args, [
     "-Action", "toast", "-Title", "Title", "-Message", "Body",
-    "-AppID", "Pi.AgentToast", "-ParentPid", String(process.pid),
+    "-AppID", "Pi.AgentToast", "-ParentPid", String(process.pid), "-Lifeline", "stdin",
     "-Icon", "C:/i.png", "-Tag", "pi-1",
   ]);
 });
@@ -229,6 +229,38 @@ test("replaces the previous toast process instead of stacking listeners", () => 
 
   toast.close();
   assert.deepEqual(killed, [0, 1]);
+});
+
+test("dispose ends the helper's stdin lifeline instead of killing it and refuses new toasts", () => {
+  const calls: string[] = [];
+  let options: { stdio?: unknown; detached?: boolean } = {};
+  const toast = new NativeToast(
+    () => {},
+    () => {},
+    undefined,
+    () => "X:/fake.exe",
+    ((_file: string, _args: readonly string[], spawnOptions: typeof options) => {
+      options = spawnOptions;
+      return {
+        stdin: { on() {}, end() { calls.push("end"); } },
+        stdout: { on() {} },
+        once() {},
+        kill() { calls.push("kill"); },
+        removeAllListeners() {},
+      };
+    }) as unknown as typeof spawn,
+  );
+
+  assert.equal(toast.show("t", "m", { appID: "Pi.AgentToast" }), true);
+  // 辅助程序靠 stdin 断开判断会话结束（-Lifeline stdin），所以 stdin 必须是管道；
+  // 还得 detached，否则 pi 退出时 libuv 的 job 会连它一起杀掉，来不及撤通知
+  assert.deepEqual(options.stdio, ["pipe", "pipe", "ignore"]);
+  assert.equal(options.detached, true);
+
+  // 不能 kill：被杀掉的辅助程序没机会把通知中心里的条目撤掉
+  toast.dispose();
+  assert.deepEqual(calls, ["end"]);
+  assert.equal(toast.show("t", "m", { appID: "Pi.AgentToast" }), false);
 });
 
 type Call = { file: string; args: readonly string[] };

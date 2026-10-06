@@ -11,9 +11,10 @@
 //   herdr-focus 1     raise the Windows Terminal window hosting the Herdr UI and select its tab
 //                     (stdout: "<hwnd> via=<method> tab=<state>", exit 2: no herdr UI window)
 //   icon              draw a rounded-square project icon: -Text <1-2 chars> -Color <RRGGBB> -Out <png path>
-//   toast             show a toast that reports clicks: -Title, -Message, -AppID, [-Icon png], [-Tag t]
-//                     (stdout: activated | dismissed | failed | timeout; stays alive for clicks from the
-//                      notification centre too, exit code 0 only on activated)
+//   toast             show a toast that reports clicks: -Title, -Message, -AppID, [-Icon png], [-Tag t],
+//                     [-ParentPid pid], [-Lifeline stdin]
+//                     (stdout: activated | dismissed | failed | timeout | closed | orphan; stays alive for
+//                      clicks from the notification centre too, exit code 0 only on activated)
 //
 // Must stay C# 5 compatible: it is compiled with the in-box .NET Framework csc.exe.
 
@@ -189,17 +190,19 @@ internal static class Program
     }
 
     // Windows keeps a toast in the action centre for hours, so a click can arrive long after the banner
-    // disappeared. Stay alive for either event; only a user-close, a dead parent, or a very long deadline
-    // ends the wait.
+    // disappeared. Stay alive for either event; only a user-close, the end of the pi session, or a very
+    // long deadline ends the wait. If the session ends first nobody is left to handle a click, so take the
+    // toast out of the action centre instead of leaving a dead entry behind.
     private static int ShowToast(Dictionary<string, string> opts)
     {
-        string title, message, appId, icon, tag, rawParent;
+        string title, message, appId, icon, tag, rawParent, lifeline;
         opts.TryGetValue("Title", out title);
         opts.TryGetValue("Message", out message);
         opts.TryGetValue("AppID", out appId);
         opts.TryGetValue("Icon", out icon);
         opts.TryGetValue("Tag", out tag);
         opts.TryGetValue("ParentPid", out rawParent);
+        opts.TryGetValue("Lifeline", out lifeline);
         int parentPid = 0;
         if (!string.IsNullOrEmpty(rawParent)) int.TryParse(rawParent, out parentPid);
         if (string.IsNullOrEmpty(appId)) return 1;
@@ -220,26 +223,54 @@ internal static class Program
         toast.ExpirationTime = DateTimeOffset.Now.AddHours(12);
 
         ManualResetEventSlim done = new ManualResetEventSlim(false);
-        string result = "timeout";
-        toast.Activated += (s, e) => { result = "activated"; done.Set(); };
+        object gate = new object();
+        string result = null;
+        // first outcome wins: a click that races the end of the session still reports "activated"
+        Action<string> finish = r => { lock (gate) { if (result == null) result = r; } done.Set(); };
+        toast.Activated += (s, e) => finish("activated");
         toast.Dismissed += (s, e) =>
         {
             // TimedOut only means the banner left the screen; the notification is still clickable in the
             // action centre, so keep waiting (this is the common case: the user clicks it later).
             if (e.Reason == ToastDismissalReason.TimedOut) return;
-            result = "dismissed";
-            done.Set();
+            finish("dismissed");
         };
-        toast.Failed += (s, e) => { result = "failed"; done.Set(); };
+        toast.Failed += (s, e) => finish("failed");
 
-        ToastNotificationManager.CreateToastNotifier(appId).Show(toast);
+        ToastNotifier notifier = ToastNotificationManager.CreateToastNotifier(appId);
+        notifier.Show(toast);
+
+        // -Lifeline stdin: pi holds our stdin open and never writes to it, so EOF means its session is over
+        // (exit, /reload, crash or a closed terminal alike) - right away, unlike the parent poll below.
+        if (lifeline == "stdin")
+        {
+            Thread watcher = new Thread(() =>
+            {
+                try
+                {
+                    Stream input = Console.OpenStandardInput();
+                    byte[] buffer = new byte[64];
+                    while (input.Read(buffer, 0, buffer.Length) > 0) { }
+                }
+                catch (Exception) { }
+                finish("closed");
+            });
+            watcher.IsBackground = true;
+            watcher.Start();
+        }
 
         // Wait in slices so a dead parent (pi crashed or was killed) does not leave us behind for hours.
         DateTime deadline = DateTime.Now.AddHours(12);
         while (DateTime.Now < deadline)
         {
             if (done.Wait(TimeSpan.FromSeconds(20))) break;
-            if (parentPid > 0 && !ProcessExists(parentPid)) { result = "orphan"; break; }
+            if (parentPid > 0 && !ProcessExists(parentPid)) { finish("orphan"); break; }
+        }
+        lock (gate) { if (result == null) result = "timeout"; }
+        if (result == "closed" || result == "orphan")
+        {
+            // Hide() from the process that showed the toast also drops it from the action centre
+            try { notifier.Hide(toast); } catch (Exception) { }
         }
         Console.Out.Write(result);
         return result == "activated" ? 0 : 1;

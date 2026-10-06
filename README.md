@@ -9,7 +9,7 @@
   - Herdr 环境（`HERDR_ENV=1`）→ `herdr agent focus <HERDR_PANE_ID>` 精确聚焦对应 pane
   - 普通 Windows Terminal → PowerShell 沿父进程链捕获 `MainWindowHandle`，点击时恢复/前置窗口（窗口级）
 - **每会话仅最新一条**：新 toast 顶替旧的，不堆叠
-- **会话退出清理**：`session_shutdown` 幂等清理控制器
+- **会话结束即撤通知**：pi 退出、`/reload`、崩溃或终端被关后，它留在通知中心的那条 toast 会被撤掉（这时已没有进程接收点击，留着点了也没反应）。原理：pi 把辅助程序的 stdin 当生命线，会话一结束管道就断，辅助程序收到 EOF 后撤下自己显示的 toast 再退出；辅助程序以 detached 方式启动，否则 pi 一退出它就被 Node 的 job 一起杀掉，来不及撤
 - **只在交互终端里自动通知**：magic-context 等扩展会在后台起 `pi --mode json/rpc` 子进程，它们也加载本扩展；这些进程不发自动通知（否则会弹出不属于你的 “Agent Run Complete”，且子进程退出后点了没反应）
 - **后台任务没跑完不算完成**：agent 用 `bg_run` 等起了跑完会唤醒它的后台任务、自己先结束这一轮时，不弹「Agent Complete」；任务跑完、agent 真正结束时才弹（通过 pi-background-tasks 的 EventBus `status` 查询，没装该扩展时照常弹）
 - **答完不再催**：提问通知的重复提醒（renotify）在终端有按键（比如回答了问题）时立即取消
@@ -90,8 +90,7 @@ npm run smoke:rpc # 端到端冒烟：spawn RPC 模式 pi → 触发 toast → �
 ## 已知限制
 
 - Windows Terminal 只能恢复到窗口级，不定位到具体 tab/pane（WT 无公开的反查 API）
-- 通知中心里的旧通知靠系统自行过期（12 小时），扩展不会主动清理别的会话的通知
-- 点击回调依赖 pi 进程存活（helper 常驻等待系统事件）；pi 退出后通知中心里的条目不再可点
+- 点击回调依赖 pi 进程存活（helper 常驻等待系统事件），所以会话结束时会撤掉自己的通知；旧版本留下的条目、或者辅助程序被手动强杀时留下的条目，仍要等系统 12 小时后过期
 - 编译 toast 支持需要 WinRT 元数据：优先用系统自带的 `C:\Windows\System32\WinMetadata`（Windows 10/11 都有，免装 SDK），其次 Windows SDK 的 `Windows.winmd`；都找不到时 toast 不显示并在 pi 里提示一次
 
 ## License

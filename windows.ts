@@ -485,11 +485,17 @@ export class NativeToast {
       "-Message", message,
       "-AppID", appearance.appID,
       "-ParentPid", String(process.pid),
+      "-Lifeline", "stdin",
     ];
     if (appearance.icon) args.push("-Icon", appearance.icon);
     if (appearance.tag) args.push("-Tag", appearance.tag);
 
-    const child = this.spawnProcess(exe, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    // stdin 是给辅助程序的“生命线”：pi 从不往里写，会话一结束（正常退出、/reload、崩溃、终端被关）管道就断，
+    // 辅助程序据此把这条 toast 从通知中心撤掉——不然它会在那里留到过期，点了也没人接。
+    // 必须 detached：libuv 把非 detached 子进程放进一个随 node 退出而关闭的 job，pi 一退出辅助程序就被
+    // 直接杀掉，来不及撤通知（实测 pi 退出后通知仍留着）。detached 后它靠 stdin EOF 自己收尾退出。
+    const child = this.spawnProcess(exe, args, { stdio: ["pipe", "pipe", "ignore"], windowsHide: true, detached: true });
+    child.stdin?.on("error", () => { /* 辅助程序先退出时关管道会报 EPIPE，无需处理 */ });
     this.child = child;
     let output = "";
     child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
@@ -507,13 +513,23 @@ export class NativeToast {
     return true;
   }
 
-  /** 关闭当前 toast 的监听进程；系统通知中心里的条目会自行过期。 */
+  /** 换新 toast 前结束旧的监听进程：不撤通知中心的条目，同 tag 的新 toast 会直接顶替它。 */
   close(): void {
     const child = this.child;
     this.child = undefined;
     if (!child) return;
     child.removeAllListeners("close");
     child.kill();
+  }
+
+  /** 会话结束：关掉 stdin，辅助程序把 toast 从通知中心撤下后自行退出；之后不再发新 toast。 */
+  dispose(): void {
+    this.closed = true;
+    const child = this.child;
+    this.child = undefined;
+    if (!child) return;
+    child.removeAllListeners("close");
+    child.stdin?.end();
   }
 }
 

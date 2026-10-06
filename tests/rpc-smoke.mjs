@@ -45,12 +45,23 @@ async function waitFor(predicate, label, timeoutMs = 10_000) {
 }
 
 // pi 退出后，等待点击的 helper 进程也应随之结束（否则 pi 崩溃会留下孤儿）。
-function helperProcessCount() {
+// 只数本次 pi 的 helper：机器上其他 pi 会话各自也有 helper 在等点击。
+function helperProcessCount(parentPid) {
   const raw = execFileSync("powershell.exe", [
     "-NoProfile", "-NonInteractive", "-Command",
-    "(Get-Process -Name 'PiToastFocus*' -ErrorAction SilentlyContinue | Measure-Object).Count",
+    `@(Get-CimInstance Win32_Process -Filter "Name like 'PiToastFocus%'" | Where-Object { $_.CommandLine -match ' -ParentPid ${parentPid} ' }).Count`,
   ], { encoding: "utf8", windowsHide: true });
   return Number(String(raw).trim()) || 0;
+}
+
+// 会话结束后它的 toast 也要从通知中心撤掉：这时已经没有进程接收点击了。
+function toastInNotificationCentre(tag) {
+  const raw = execFileSync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command",
+    "$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]; " +
+    `@([Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory('Pi.AgentToast') | Where-Object { $_.Tag -eq '${tag}' }).Count`,
+  ], { encoding: "utf8", windowsHide: true });
+  return (Number(String(raw).trim()) || 0) > 0;
 }
 
 function activatePipe(pipeName) {
@@ -84,21 +95,25 @@ try {
     throw new Error(`Unexpected RPC response: ${JSON.stringify(response)}`);
   }
 
-  await delay(500);
+  const tag = `pi-${pi.pid}`;
+  await waitFor(() => toastInNotificationCentre(tag), "the toast to reach the notification centre", 10_000);
   pi.stdin.end();
 
   const result = await exit;
   if (result.code !== 0) throw new Error(`Pi exited with ${JSON.stringify(result)}\n${stderr}`);
   await delay(300);
 
-  const leftovers = helperProcessCount();
+  const leftovers = helperProcessCount(pi.pid);
   if (leftovers > 0) throw new Error(leftovers + " toast helper process(es) survived shutdown");
+  const toastLeft = toastInNotificationCentre(tag);
+  if (toastLeft) throw new Error("the toast stayed in the notification centre after shutdown");
 
   console.log(JSON.stringify({
     rpcDisposition: response.data.disposition,
     toastSent: records.some((r) => r.type === "extension_ui_request" && String(r.message || "").includes("toast sent")),
     piExitCode: result.code,
     helperProcessesAfterShutdown: leftovers,
+    toastLeftInNotificationCentre: toastLeft,
   }));
 } finally {
   clearTimeout(timeout);
