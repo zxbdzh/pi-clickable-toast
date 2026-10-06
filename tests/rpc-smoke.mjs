@@ -1,8 +1,4 @@
 import { execFileSync, spawn } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { connect } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
 const extension = "C:/Users/1/.pi/agent/extensions/clickable-toast/index.ts";
@@ -62,16 +58,6 @@ function toastInNotificationCentre(tag) {
     `@([Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory('Pi.AgentToast') | Where-Object { $_.Tag -eq '${tag}' }).Count`,
   ], { encoding: "utf8", windowsHide: true });
   return (Number(String(raw).trim()) || 0) > 0;
-}
-
-function activatePipe(pipeName) {
-  return new Promise((resolve, reject) => {
-    const socket = connect(pipeName, () => {
-      socket.end(Buffer.from("action=activate", "utf16le"));
-    });
-    socket.once("error", reject);
-    socket.once("close", resolve);
-  });
 }
 
 const exit = new Promise((resolve) => pi.once("exit", (code, signal) => resolve({ code, signal })));

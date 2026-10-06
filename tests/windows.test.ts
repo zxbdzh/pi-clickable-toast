@@ -12,7 +12,7 @@ import {
   findWinmdRefs,
   ensureProjectIcon,
   focusOrigin,
-  helperCommand,
+  nativeHelper,
   parseHerdrFocusOutput,
   registerToastApp,
   withoutHerdrEnv,
@@ -32,27 +32,20 @@ test("parses herdr-focus output in both the old and the new format", () => {
   assert.equal(parseHerdrFocusOutput("no herdr client window found"), undefined);
 });
 
-test("prefers the native helper once it exists and falls back to PowerShell otherwise", () => {
-  const native = helperCommand(() => true);
-  assert.equal(native.native, true);
-  assert.match(native.file, /PiToastFocus-[0-9a-f]{12}\.exe$/);
-  assert.deepEqual(native.args, []);
-
-  const fallback = helperCommand(() => false);
-  assert.equal(fallback.native, false);
-  assert.equal(fallback.file, "powershell.exe");
-  assert.ok(fallback.args.includes("-File"));
+test("uses the native helper only once it has been compiled", () => {
+  assert.match(nativeHelper(() => true) ?? "", /PiToastFocus-[0-9a-f]{12}\.exe$/);
+  // 还没编译好时没有任何回退（toast 本来也弹不出来），调用方据此跳过
+  assert.equal(nativeHelper(() => false), undefined);
 });
 
 test("focus.cs compiles with the in-box csc and the exe answers harmless queries", async () => {
   assert.equal(await buildNativeHelper(), true, "csc build failed");
-  const helper = helperCommand();
-  assert.equal(helper.native, true);
-  assert.ok(existsSync(helper.file));
+  const helper = nativeHelper();
+  assert.ok(helper && existsSync(helper));
   // 只跑不会改变前台窗口的动作：未知动作、缺参数、不存在的窗口句柄
   const exit = (args: string[]): number => {
     try {
-      execFileSync(helper.file, args, { stdio: "ignore" });
+      execFileSync(helper, args, { stdio: "ignore" });
       return 0;
     } catch (error) {
       return (error as { status?: number }).status ?? -1;

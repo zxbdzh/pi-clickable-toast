@@ -7,7 +7,7 @@
 - **接管全部 native toast**：自动事件（`agent_end`、`workflow_end`、`ask_user_prompt` 等）和手动 `notify_user` 的 native 通道都由本扩展发送
 - **点击回来源**：
   - Herdr 环境（`HERDR_ENV=1`）→ `herdr agent focus <HERDR_PANE_ID>` 精确聚焦对应 pane
-  - 普通 Windows Terminal → PowerShell 沿父进程链捕获 `MainWindowHandle`，点击时恢复/前置窗口（窗口级）
+  - 普通 Windows Terminal → 原生辅助程序沿父进程链捕获 `MainWindowHandle`，点击时恢复/前置窗口（窗口级）
 - **每会话仅最新一条**：新 toast 顶替旧的，不堆叠
 - **会话结束即撤通知**：pi 退出、`/reload`、崩溃或终端被关后，它留在通知中心的那条 toast 会被撤掉（这时已没有进程接收点击，留着点了也没反应）。原理：pi 把辅助程序的 stdin 当生命线，会话一结束管道就断，辅助程序收到 EOF 后撤下自己显示的 toast 再退出；辅助程序以 detached 方式启动，否则 pi 一退出它就被 Node 的 job 一起杀掉，来不及撤
 - **只在交互终端里自动通知**：magic-context 等扩展会在后台起 `pi --mode json/rpc` 子进程，它们也加载本扩展；这些进程不发自动通知（否则会弹出不属于你的 “Agent Run Complete”，且子进程退出后点了没反应）
@@ -20,11 +20,9 @@
 ```powershell
 # 复制到 pi 扩展目录
 xcopy /E /I pi-clickable-toast "%USERPROFILE%\.pi\agent\extensions\clickable-toast"
-cd "%USERPROFILE%\.pi\agent\extensions\clickable-toast"
-npm install
 ```
 
-无运行时依赖：toast 和窗口定位都由 `focus.cs` 编译出的原生 exe 完成（见下）。
+无运行时依赖，不需要 `npm install`：toast 和窗口定位都由 `focus.cs` 编译出的原生 exe 完成（见下）。
 
 ## 配置
 
@@ -56,7 +54,7 @@ npm install
 
 默认 toast 有两处图标：
 
-- **左上角小图标**：由 `appName` 和一个注册表项（`HKCU\Software\Classes\AppUserModelId\Pi.ClickableToast`，不需要管理员权限）决定，用自带图标。第一次发通知时自动写入。
+- **左上角小图标**：由 `appName` 和一个注册表项（`HKCU\Software\Classes\AppUserModelId\Pi.AgentToast`，不需要管理员权限）决定，用自带图标。第一次发通知时自动写入。
 - **正文左侧大图**：由 `projectIcon` 按项目名生成 —— 名字里有分隔符（`-` `_` 空格 `.`）就取前两个词的首字母（`andornot-schedule` → `AS`），否则取第一个字符（`Huajingflow` → `H`）；颜色由项目名的哈希决定，所以同一个项目永远是同一个颜色，换机器也一样。生成的文件缓存在 `%TEMP%\pi-clickable-toast\icons\`。
 
 `icon` 指向不存在的文件时会回退到项目图标，并在 pi 里提示一次。
@@ -76,16 +74,16 @@ npm install
 
 ## 性能
 
-点击后的定位走一个约 10 KB 的原生 exe（`focus.cs`，用系统自带的 .NET Framework `csc.exe` 首次编译后缓存到 `%TEMP%\pi-clickable-toast\`，按源码哈希命名）。机器上没有 `csc.exe` 时自动回退到 `window.ps1`（慢 2~3 倍，功能相同）。实测点击到完成约 0.5 秒。
+toast 的显示和点击接收、点击后的定位都走一个约 16 KB 的原生 exe（`focus.cs`，用系统自带的 .NET Framework `csc.exe` 首次编译后缓存到 `%TEMP%\pi-clickable-toast\`，按源码哈希命名）。机器上没有 `csc.exe`、或找不到 WinRT 元数据导致编译失败时，toast 不可用（在 pi 里提示一次）。实测点击到完成约 0.5 秒。
 
 ## 测试
 
 ```powershell
 npm test          # 单元测试（core/windows 逻辑）
-npm run smoke:rpc # 端到端冒烟：spawn RPC 模式 pi → 触发 toast → 模拟 pipe 点击 → 验证清理
+npm run smoke:rpc # 端到端冒烟：spawn RPC 模式 pi → 发测试 toast → 退出 pi → 验证辅助程序已退出、通知已从通知中心撤掉
 ```
 
-冒烟脚本要求 Windows + PowerShell（CIM/SnoreToast 进程查询）。
+冒烟脚本要求 Windows + PowerShell（用 CIM 查辅助程序进程、用 WinRT 查通知中心），pi 与扩展路径写死在脚本开头，换机器要改。
 
 ## 已知限制
 

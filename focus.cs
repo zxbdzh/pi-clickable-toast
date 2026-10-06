@@ -1,10 +1,8 @@
-// PiToastFocus: tiny native helper used by the clickable-toast extension.
+// PiToastFocus: tiny native helper used by the clickable-toast extension. It shows the toasts and
+// reports their clicks, and finds and focuses the source terminal afterwards. It starts in tens of
+// milliseconds, where a PowerShell script needed 1.1-1.8 s per call for the same work.
 //
-// It replaces window.ps1 on the hot path. Starting PowerShell plus its first-call JIT costs
-// 1.1-1.8 s on every click; this exe starts in tens of milliseconds. window.ps1 stays as a
-// fallback for machines where the .NET Framework C# compiler is unavailable.
-//
-// Same CLI as window.ps1:   PiToastFocus.exe -Action <name> -Value <number>
+// CLI:   PiToastFocus.exe -Action <name> -Value <number>
 //   capture <pid>     print the first ancestor window handle of <pid>        (exit 2: none)
 //   focus <hwnd>      bring a top-level window to the foreground and verify   (exit 3: refused)
 //   foreground <hwnd> print True/False: is the window already in the foreground

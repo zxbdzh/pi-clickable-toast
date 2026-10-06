@@ -25,23 +25,7 @@ function systemExecFile(
   });
 }
 
-const POWERSHELL = "powershell.exe";
-const WINDOW_HELPER = fileURLToPath(new URL("./window.ps1", import.meta.url));
 const HELPER_SOURCE = fileURLToPath(new URL("./focus.cs", import.meta.url));
-const POWERSHELL_ARGS = [
-  "-NoProfile",
-  "-NonInteractive",
-  "-ExecutionPolicy",
-  "Bypass",
-  "-File",
-  WINDOW_HELPER,
-] as const;
-
-export interface HelperCommand {
-  file: string;
-  args: string[];
-  native: boolean;
-}
 
 let cachedExePath: string | null | undefined;
 
@@ -59,13 +43,12 @@ function nativeHelperPath(): string | undefined {
 }
 
 /**
- * 热路径优先用原生 exe（启动几十毫秒），尚未编译或编译失败时回退到 PowerShell 脚本
- * （启动 + JIT 预热每次 1.1~1.8 秒）。两者命令行约定一致：-Action <名称> -Value <数字>。
+ * 已编译好的原生辅助程序 exe；还没编译或编译失败时为 undefined。
+ * toast 的显示和点击接收、窗口捕获、点击后的定位都靠它。没有它 toast 根本弹不出来，所以不需要别的回退。
  */
-export function helperCommand(exists: (path: string) => boolean = existsSync): HelperCommand {
+export function nativeHelper(exists: (path: string) => boolean = existsSync): string | undefined {
   const exe = nativeHelperPath();
-  if (exe && exists(exe)) return { file: exe, args: [], native: true };
-  return { file: POWERSHELL, args: [...POWERSHELL_ARGS], native: false };
+  return exe && exists(exe) ? exe : undefined;
 }
 
 const WINMD_CANDIDATES = [
@@ -129,7 +112,7 @@ export function findWinmdRefs(exists: (path: string) => boolean = existsSync, re
 
 let buildInFlight: Promise<boolean> | undefined;
 
-/** 后台编译 focus.cs；成功后 helperCommand 自动改用 exe。失败则一直走 PowerShell 版。 */
+/** 后台编译 focus.cs（首次或源码变了之后）；失败时 toast 不可用。 */
 export function buildNativeHelper(): Promise<boolean> {
   buildInFlight ??= (async () => {
     const exe = nativeHelperPath();
@@ -151,7 +134,7 @@ export function buildNativeHelper(): Promise<boolean> {
         join(wpf, "UIAutomationTypes.dll"),
         join(wpf, "WindowsBase.dll"),
       ];
-      // WinRT (toast) 元数据：优先系统自带 System32\WinMetadata（免 SDK），其次 SDK 合并 winmd；都没有则 focus.cs 编译失败：toast 不可用，窗口定位回退到 window.ps1。
+      // WinRT (toast) 元数据：优先系统自带 System32\WinMetadata（免 SDK），其次 SDK 合并 winmd；都没有则 focus.cs 编译失败，toast 不可用。
       if (winmdRefs.length > 0) {
         references.push(...winmdRefs, join(framework, "System.Runtime.dll"), join(framework, "System.Runtime.WindowsRuntime.dll"), join(framework, "System.Runtime.InteropServices.WindowsRuntime.dll"));
       }
@@ -178,9 +161,11 @@ export function buildNativeHelper(): Promise<boolean> {
   return buildInFlight;
 }
 
+/** exe 还没编译好时执行会以 ENOENT 失败，调用方都按失败处理。 */
 function helperInvocation(action: string, value: string | number): { file: string; args: string[] } {
-  const helper = helperCommand();
-  return { file: helper.file, args: [...helper.args, "-Action", action, "-Value", numeric(value)] };
+  const exe = nativeHelperPath();
+  if (!exe) throw new Error("focus.cs is missing");
+  return { file: exe, args: ["-Action", action, "-Value", numeric(value)] };
 }
 
 function numeric(value: string | number): string {
@@ -463,7 +448,7 @@ export class NativeToast {
     onActivate: () => void | Promise<void>,
     onError: (error: Error) => void,
     onEvent?: (result: string) => void,
-    helper: () => string | undefined = () => (helperCommand().native ? nativeHelperPath() : undefined),
+    helper: () => string | undefined = nativeHelper,
     spawnProcess: typeof spawn = spawn,
   ) {
     this.onActivate = onActivate;

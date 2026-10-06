@@ -74,7 +74,7 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-06-exit-cleanup";
+const BUILD_TAG = "2026-10-06-native-only";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -136,7 +136,6 @@ export default function clickableToast(pi: ExtensionAPI): void {
     const target = origin;
     if (!target) return;
     // Herdr 场景由 herdr-focus 直接查找客户端窗口，用不到 pi 自己的窗口句柄。
-    // 旧的 PowerShell 版每次要跑十几秒 CIM 查询，且每次交互输入都会触发。
     if (target.herdrPaneId) return;
     const hwnd = await captureTerminalWindowHandle();
     if (origin === target && hwnd) target.hwnd = hwnd;
@@ -288,10 +287,9 @@ export default function clickableToast(pi: ExtensionAPI): void {
     void buildNativeHelper().then((ok) => {
       nativeToastReady = ok;
       debugLog(`native helper: ${ok ? "ready" : "unavailable, toast disabled"}`);
+      // 窗口句柄要靠辅助程序捕获，所以等它就绪再取；之后每次输入还会再取一次。
+      if (ok) void refreshWindowHandle();
     });
-    // 不 await：PowerShell/WMI 冷启动可拖慢 RPC/TUI 启动数秒，
-    // 窗口句柄在首次 input 或发 toast 前再取即可。
-    void refreshWindowHandle();
     registerBusListeners();
 
     // 终端里有按键（比如回答了提问）说明人就在跟前，取消“还在等你”的重复提醒。
@@ -392,11 +390,12 @@ export default function clickableToast(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       context = ctx;
       if (!origin) origin = createOrigin(ctx.cwd);
-      await refreshWindowHandle();
       if (!controller) {
         controller = new NativeToast(activateOrigin, (error) => reportOnce("toast", error.message), onToastEvent);
         nativeToastReady = await buildNativeHelper();
       }
+      // 捕获窗口句柄要用辅助程序，所以放在编译之后
+      await refreshWindowHandle();
       const loaded = readConfig();
       if (!loaded?.clickable.enabled) {
         ctx.ui.notify("Clickable toast is disabled in clickable-toast.json", "warning");
