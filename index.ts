@@ -13,6 +13,7 @@ import {
   autoEventUsesNative,
   buildEventNotification,
   createOrigin,
+  hasPendingWakeTask,
   manualRequestUsesNative,
   normalizeClickableConfig,
   normalizeNotifyConfig,
@@ -48,7 +49,6 @@ const BUS_EVENTS: ReadonlyArray<[string, KnownEvent]> = [
   ["rpiv:ask-user:prompt", "ask_user_prompt"],
   ["permissions:ui_prompt", "permission_request"],
 ];
-const SHARED_TASK_REGISTRY = Symbol.for("unipi.background-tasks.shared-registry");
 
 interface ManualNotification {
   title: string;
@@ -74,7 +74,7 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-06-tui-only";
+const BUILD_TAG = "2026-10-06-pending-wake";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -91,19 +91,6 @@ function loadNotifyConfig(): NotifyConfig {
   return normalizeNotifyConfig(parseJson(NOTIFY_CONFIG_PATH));
 }
 
-function hasPendingWakeTask(): boolean {
-  try {
-    const registry = (globalThis as Record<symbol, unknown>)[SHARED_TASK_REGISTRY] as {
-      allTasks?: () => ReadonlyArray<{ status?: string; triggerOnCompletion?: boolean }>;
-    } | undefined;
-    return registry?.allTasks?.().some(
-      (task) => task.status === "running" && task.triggerOnCompletion === true,
-    ) === true;
-  } catch {
-    return false;
-  }
-}
-
 export default function clickableToast(pi: ExtensionAPI): void {
   let context: ExtensionContext | undefined;
   let origin: Origin | undefined;
@@ -112,6 +99,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
   let lastInputAt = 0;
   let renotifyTimer: ReturnType<typeof setInterval> | undefined;
   let busUnsubscribers: Array<() => void> = [];
+  let unsubTerminalInput: (() => void) | undefined;
   let lastAutomatic: { signature: string; at: number } | undefined;
   const pendingManual = new Map<string, ManualNotification>();
   const reported = new Set<string>();
@@ -249,7 +237,10 @@ export default function clickableToast(pi: ExtensionAPI): void {
   const handleAutomatic = async (eventKey: KnownEvent, payload: unknown): Promise<void> => {
     const loaded = readConfig();
     if (!loaded?.clickable.enabled || !autoEventUsesNative(loaded.notify, eventKey)) return;
-    if ((eventKey === "agent_end" || eventKey === "agent_settled") && hasPendingWakeTask()) return;
+    if ((eventKey === "agent_end" || eventKey === "agent_settled") && await hasPendingWakeTask(pi.events)) {
+      debugLog(`skip: ${eventKey}, a background task will wake the agent`);
+      return;
+    }
 
     const notification = buildEventNotification(eventKey, payload, pi.getSessionName?.());
     const signature = `${eventKey}\0${notification.message}`;
@@ -282,6 +273,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
     reported.clear();
     pendingManual.clear();
     disarmRenotify();
+    unsubTerminalInput?.();
+    unsubTerminalInput = undefined;
     // 只有交互终端会话自动发通知。magic-context 等扩展会在后台起 `pi --mode json/rpc` 子进程，
     // 子进程同样加载本扩展：它的 agent_end 不是用户的 agent 结束，而且跑完即退出，toast 点了也没人接。
     if (ctx.mode !== "tui") {
@@ -300,6 +293,16 @@ export default function clickableToast(pi: ExtensionAPI): void {
     // 窗口句柄在首次 input 或发 toast 前再取即可。
     void refreshWindowHandle();
     registerBusListeners();
+
+    // 终端里有按键（比如回答了提问）说明人就在跟前，取消“还在等你”的重复提醒。
+    // 回答提问不会触发 agent_start，不在这里取消的话，问题答完后重复提醒还会接着弹。
+    unsubTerminalInput = ctx.ui.onTerminalInput(() => {
+      if (renotifyTimer !== undefined) {
+        debugLog("renotify: cancelled by terminal input");
+        disarmRenotify();
+      }
+      return undefined;
+    });
 
     const loaded = readConfig();
     if (loaded?.clickable.enabled) {
@@ -371,6 +374,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", () => {
     disarmRenotify();
+    unsubTerminalInput?.();
+    unsubTerminalInput = undefined;
     for (const unsubscribe of busUnsubscribers) {
       try { unsubscribe(); } catch { /* already removed */ }
     }

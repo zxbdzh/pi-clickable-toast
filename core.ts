@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 
 export const KNOWN_EVENTS = [
@@ -134,6 +135,44 @@ export function shouldSilenceNative(
   const silence = config.silenceAfterInput;
   if (!silence.enabled || lastInputAt <= 0 || now - lastInputAt >= silence.windowMs) return false;
   return silence.platforms.length === 0 || silence.platforms.includes("native");
+}
+
+/** pi.events 的最小子集，单测可注入假总线。 */
+export interface EventBusLike {
+  on(channel: string, handler: (data: unknown) => void): () => void;
+  emit(channel: string, data: unknown): void;
+}
+
+/**
+ * agent 结束一轮时，pi-background-tasks 里可能还有跑完会唤醒它的任务（bg_run 等），
+ * 这时 agent 并没有完成，应等任务唤醒它、真正结束后再提示。
+ * 走该扩展公开的 EventBus status 查询；没装、未就绪或超时都按“没有”处理，宁可多弹也不吞掉完成通知。
+ */
+export function hasPendingWakeTask(events: EventBusLike, timeoutMs = 1_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const requestId = `clickable-toast-${randomUUID()}`;
+    const finish = (pending: boolean): void => {
+      clearTimeout(timer);
+      off();
+      resolve(pending);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const off = events.on("pi-background-tasks:response:v1", (data) => {
+      const frame = record(data);
+      if (frame.request_id !== requestId) return;
+      const tasks = frame.ok === true ? record(frame.result).tasks : undefined;
+      finish(Array.isArray(tasks) && tasks.some((task) => {
+        const item = record(task);
+        return item.status === "running" && item.triggerOnCompletion === true;
+      }));
+    });
+    events.emit("pi-background-tasks:request:v1", {
+      schema_version: "pi-background-tasks.extension-request.v1",
+      request_id: requestId,
+      operation: "status",
+      payload: {},
+    });
+  });
 }
 
 function text(value: unknown): string | undefined {

@@ -5,6 +5,7 @@ import {
   autoEventUsesNative,
   buildEventNotification,
   createOrigin,
+  hasPendingWakeTask,
   manualRequestUsesNative,
   normalizeClickableConfig,
   normalizeNotifyConfig,
@@ -102,4 +103,30 @@ test("clickable config defaults: no source line, project icon on, app name Pi, b
   );
   // 空白字符串不能覆盖默认值
   assert.deepEqual(normalizeClickableConfig({ appName: "  ", icon: "" }), normalizeClickableConfig({}));
+});
+
+test("hasPendingWakeTask asks pi-background-tasks over the event bus and only counts running tasks that wake the agent", async () => {
+  // 假总线：收到 status 请求后先回一条别人的响应（必须忽略），再异步回本次请求的结果
+  const bus = (tasks?: unknown[]) => {
+    const listeners = new Map<string, Array<(data: unknown) => void>>();
+    const emit = (channel: string, data: unknown): void => {
+      for (const handler of [...(listeners.get(channel) ?? [])]) handler(data);
+      const request = data as { request_id: string; operation: string };
+      if (channel !== "pi-background-tasks:request:v1" || !tasks || request.operation !== "status") return;
+      emit("pi-background-tasks:response:v1", { request_id: "someone-else", ok: true, result: { tasks: [{ status: "running", triggerOnCompletion: true }] } });
+      queueMicrotask(() => emit("pi-background-tasks:response:v1", { request_id: request.request_id, ok: true, result: { tasks } }));
+    };
+    return {
+      emit,
+      on(channel: string, handler: (data: unknown) => void) {
+        listeners.set(channel, [...(listeners.get(channel) ?? []), handler]);
+        return () => listeners.set(channel, (listeners.get(channel) ?? []).filter((item) => item !== handler));
+      },
+    };
+  };
+
+  assert.equal(await hasPendingWakeTask(bus([{ status: "completed", triggerOnCompletion: true }, { status: "running", triggerOnCompletion: true }])), true);
+  assert.equal(await hasPendingWakeTask(bus([{ status: "running", triggerOnCompletion: false }, { status: "completed", triggerOnCompletion: true }])), false);
+  // 没装 pi-background-tasks：没人回应，超时按“没有”处理
+  assert.equal(await hasPendingWakeTask(bus(), 20), false);
 });

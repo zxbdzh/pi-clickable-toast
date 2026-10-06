@@ -11,6 +11,8 @@
 - **每会话仅最新一条**：新 toast 顶替旧的，不堆叠
 - **会话退出清理**：`session_shutdown` 幂等清理控制器
 - **只在交互终端里自动通知**：magic-context 等扩展会在后台起 `pi --mode json/rpc` 子进程，它们也加载本扩展；这些进程不发自动通知（否则会弹出不属于你的 “Agent Run Complete”，且子进程退出后点了没反应）
+- **后台任务没跑完不算完成**：agent 用 `bg_run` 等起了跑完会唤醒它的后台任务、自己先结束这一轮时，不弹「Agent Complete」；任务跑完、agent 真正结束时才弹（通过 pi-background-tasks 的 EventBus `status` 查询，没装该扩展时照常弹）
+- **答完不再催**：提问通知的重复提醒（renotify）在终端有按键（比如回答了问题）时立即取消
 - **来源标识**：toast 正文末尾追加 `项目名 · pane xxx` / `项目名 · WT xxxxxxxx`
 
 ## 安装
