@@ -121,6 +121,22 @@ test("completion notification title and body follow the run outcome", () => {
   });
 });
 
+test("a settled reply stays visible while background work is running", () => {
+  assert.deepEqual(buildEventNotification("agent_settled", {
+    status: "completed", detail: "预览已经可以打开。", pendingBackground: true,
+  }), {
+    title: "Pi — Reply Ready",
+    message: "预览已经可以打开。",
+  });
+  assert.deepEqual(buildEventNotification("agent_settled", { status: "completed", pendingBackground: true }), {
+    title: "Pi — Reply Ready",
+    message: "Agent replied; background tasks are still running",
+  });
+  // 常驻服务不能把报错或非用户中断的通知吞掉，也不能改成成功标题
+  assert.equal(buildEventNotification("agent_settled", { status: "error", pendingBackground: true }).title, "Pi — Agent Failed");
+  assert.equal(buildEventNotification("agent_settled", { status: "aborted", pendingBackground: true }).title, "Pi — Agent Stopped");
+});
+
 test("source line shows only the project name, never pane or terminal session ids", () => {
   const herdr = createOrigin("C:/work/demo", {
     HERDR_ENV: "1",
@@ -179,8 +195,9 @@ test("hasPendingWakeTask asks pi-background-tasks over the event bus and only co
     };
   };
 
-  assert.equal(await hasPendingWakeTask(bus([{ status: "completed", triggerOnCompletion: true }, { status: "running", triggerOnCompletion: true }])), true);
+  assert.equal(await hasPendingWakeTask(bus([{ status: "completed", notifyOnCompletion: true, triggerOnCompletion: true }, { status: "running", notifyOnCompletion: true, triggerOnCompletion: true }])), true);
   assert.equal(await hasPendingWakeTask(bus([{ status: "running", triggerOnCompletion: false }, { status: "completed", triggerOnCompletion: true }])), false);
+  assert.equal(await hasPendingWakeTask(bus([{ status: "running", notifyOnCompletion: false, triggerOnCompletion: true }])), false);
   // 没装 pi-background-tasks：没人回应，超时按“没有”处理
   assert.equal(await hasPendingWakeTask(bus(), 20), false);
 });

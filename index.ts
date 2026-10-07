@@ -76,7 +76,7 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-06-run-outcome";
+const BUILD_TAG = "2026-10-07-reply-ready";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -242,19 +242,23 @@ export default function clickableToast(pi: ExtensionAPI): void {
   const handleAutomatic = async (eventKey: KnownEvent, payload: unknown): Promise<void> => {
     const loaded = readConfig();
     if (!loaded?.clickable.enabled || !autoEventUsesNative(loaded.notify, eventKey)) return;
+    let notificationPayload: unknown = payload;
     if (eventKey === "agent_end" || eventKey === "agent_settled") {
       // 按 Esc 停下时人就在终端前，不用提醒；没人按键的中断（如 magic-context 拒绝本轮）照常提示
-      if ((payload as RunOutcome | undefined)?.status === "aborted" && Date.now() - lastKeyAt < 10_000) {
+      const outcome = payload as RunOutcome | undefined;
+      if (outcome?.status === "aborted" && Date.now() - lastKeyAt < 10_000) {
         debugLog(`skip: ${eventKey}, stopped by the user`);
         return;
       }
-      if (await hasPendingWakeTask(pi.events)) {
-        debugLog(`skip: ${eventKey}, a background task will wake the agent`);
-        return;
+      // 后台服务（dev server 等）常驻不退出，不能因此吞掉回复提醒：成功回复且还有会唤醒 agent 的任务时，
+      // 改弹 Reply Ready；报错和无人值守的中断必须立即通知
+      if (outcome?.status === "completed" && await hasPendingWakeTask(pi.events)) {
+        notificationPayload = { ...outcome, pendingBackground: true };
+        debugLog(`reply ready: ${eventKey}, a background task will wake the agent`);
       }
     }
 
-    const notification = buildEventNotification(eventKey, payload, pi.getSessionName?.());
+    const notification = buildEventNotification(eventKey, notificationPayload, pi.getSessionName?.());
     const signature = `${eventKey}\0${notification.message}`;
     const now = Date.now();
     if (lastAutomatic?.signature === signature && now - lastAutomatic.at < 750) return;

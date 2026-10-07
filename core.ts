@@ -163,7 +163,7 @@ export function hasPendingWakeTask(events: EventBusLike, timeoutMs = 1_000): Pro
       const tasks = frame.ok === true ? record(frame.result).tasks : undefined;
       finish(Array.isArray(tasks) && tasks.some((task) => {
         const item = record(task);
-        return item.status === "running" && item.triggerOnCompletion === true;
+        return item.status === "running" && item.notifyOnCompletion !== false && item.triggerOnCompletion === true;
       }));
     });
     events.emit("pi-background-tasks:request:v1", {
@@ -221,6 +221,7 @@ function permissionMessage(payload: unknown): string {
 export interface RunOutcome {
   status: "completed" | "error" | "aborted";
   detail?: string;
+  pendingBackground?: boolean;
 }
 
 /** 第一行非空文字：去掉 markdown 加粗和标题/引用前缀；过长截断（toast 本来也显示不下，还能避免命令行过长）。 */
@@ -291,6 +292,10 @@ export function buildEventNotification(
       let fallback = eventKey === "agent_end" ? "Agent run is complete" : "Agent is complete";
       if (p.status === "error") [label, fallback] = ["Agent Failed", "Agent stopped with an error"];
       if (p.status === "aborted") [label, fallback] = ["Agent Stopped", "Agent stopped before finishing"];
+      if (p.pendingBackground === true && p.status === "completed") {
+        label = "Reply Ready";
+        fallback = "Agent replied; background tasks are still running";
+      }
       const body = text(p.detail) ?? fallback;
       message = sessionName ? `${sessionName} - ${body}` : body;
       break;
