@@ -341,10 +341,11 @@ export interface IconDeps {
   dir?: string;
 }
 
+const ICON_RENDER_VERSION = 2; // Re-render cached icons when the native drawing changes.
 const iconInFlight = new Map<string, Promise<string | undefined>>();
 
 /**
- * 按项目名生成 toast 大图（首字母 + 固定颜色），写到 %TEMP% 下并缓存。文件名只由文字和颜色决定，
+ * 按项目名生成 toast 大图（首字母 + 固定颜色），写到 %TEMP% 下并缓存。文件名包含文字、颜色和绘制版本，
  * 所以不同项目如果算出同样的结果会共用一个文件。原生辅助程序不可用或绘制失败时返回 undefined，
  * 调用方回退到自带图标。
  */
@@ -352,7 +353,7 @@ export function ensureProjectIcon(project: string, deps: IconDeps = {}): Promise
   const spec = projectIconSpec(project);
   const dir = deps.dir ?? join(tmpdir(), "pi-clickable-toast", "icons");
   const codePoints = Array.from(spec.letter).map((ch) => ch.codePointAt(0)?.toString(16)).join("-");
-  const target = join(dir, `${codePoints}-${spec.color}.png`);
+  const target = join(dir, `${codePoints}-${spec.color}-v${ICON_RENDER_VERSION}.png`);
   const exists = deps.exists ?? existsSync;
   if (exists(target)) return Promise.resolve(target);
 

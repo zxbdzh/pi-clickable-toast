@@ -136,8 +136,21 @@ internal static class Program
     }
 
     // ---- icon: per-project avatar for the toast image ----------------------------------------
+    private static double SrgbChannel(byte value)
+    {
+        double srgb = value / 255.0;
+        return srgb <= 0.03928 ? srgb / 12.92 : Math.Pow((srgb + 0.055) / 1.055, 2.4);
+    }
 
-    // 256x256 rounded square in <color> with the text centred in white (same shape as the built-in icon)
+    // Keep initials readable on the brighter hash-generated colors.
+    private static Brush IconTextBrush(Color fill)
+    {
+        double luminance = 0.2126 * SrgbChannel(fill.R) + 0.7152 * SrgbChannel(fill.G) + 0.0722 * SrgbChannel(fill.B);
+        return luminance > 0.179 ? Brushes.Black : Brushes.White;
+    }
+
+
+    // 256x256 rounded square in <color> with contrast-aware centred initials (same shape as the built-in icon)
     private static int MakeIcon(string text, string colorHex, string outPath)
     {
         int rgb;
@@ -168,7 +181,7 @@ internal static class Program
             {
                 format.Alignment = StringAlignment.Center;
                 format.LineAlignment = StringAlignment.Center;
-                g.DrawString(text, font, Brushes.White, new RectangleF(0, 4, size, size), format);
+                g.DrawString(text, font, IconTextBrush(fill), new RectangleF(0, 4, size, size), format);
             }
             // write next to the target and copy over it, so a reader never sees a half-written PNG
             string tmp = outPath + "." + Process.GetCurrentProcess().Id + ".tmp";
