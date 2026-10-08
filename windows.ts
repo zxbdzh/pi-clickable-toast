@@ -463,7 +463,7 @@ export class NativeToast {
     if (this.closed) return false;
     const exe = this.helper();
     if (!exe || !appearance.appID) return false;
-    this.close();
+    const previous = this.child;
 
     const args = [
       "-Action", "toast",
@@ -480,14 +480,28 @@ export class NativeToast {
     // 辅助程序据此把这条 toast 从通知中心撤掉——不然它会在那里留到过期，点了也没人接。
     // 必须 detached：libuv 把非 detached 子进程放进一个随 node 退出而关闭的 job，pi 一退出辅助程序就被
     // 直接杀掉，来不及撤通知（实测 pi 退出后通知仍留着）。detached 后它靠 stdin EOF 自己收尾退出。
-    const child = this.spawnProcess(exe, args, { stdio: ["pipe", "pipe", "ignore"], windowsHide: true, detached: true });
+    let child: ChildProcess;
+    try {
+      child = this.spawnProcess(exe, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: true });
+    } catch (error) {
+      this.onError(error instanceof Error ? error : new Error(String(error)));
+      return false;
+    }
     child.stdin?.on("error", () => { /* 辅助程序先退出时关管道会报 EPIPE，无需处理 */ });
     this.child = child;
+    if (previous) {
+      previous.removeAllListeners("close");
+      previous.removeAllListeners("error");
+      previous.kill();
+    }
     let output = "";
     child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+    let errorOutput = "";
+    child.stderr?.on("data", (chunk: Buffer) => { errorOutput += chunk.toString("utf8"); });
     const finish = (): void => {
       if (this.child === child) this.child = undefined;
-      const result = output.trim() || "unknown";
+      const error = errorOutput.trim().replace(/\s+/g, " ").slice(0, 240);
+      const result = output.trim() || (error ? `failed: ${error}` : "unknown");
       this.onEvent?.(result);
       if (result === "activated") void this.onActivate();
     };
@@ -505,6 +519,7 @@ export class NativeToast {
     this.child = undefined;
     if (!child) return;
     child.removeAllListeners("close");
+    child.removeAllListeners("error");
     child.kill();
   }
 
@@ -515,6 +530,7 @@ export class NativeToast {
     this.child = undefined;
     if (!child) return;
     child.removeAllListeners("close");
+    child.removeAllListeners("error");
     child.stdin?.end();
   }
 }

@@ -34,7 +34,7 @@ test("parses herdr-focus output in both the old and the new format", () => {
 
 test("uses the native helper only once it has been compiled", () => {
   assert.match(nativeHelper(() => true) ?? "", /PiToastFocus-[0-9a-f]{12}\.exe$/);
-  // 还没编译好时没有任何回退（toast 本来也弹不出来），调用方据此跳过
+  // helper 尚未编译好时不可用；正常 session_start 会缓存首条通知并在 ready 后发送
   assert.equal(nativeHelper(() => false), undefined);
 });
 
@@ -224,6 +224,64 @@ test("replaces the previous toast process instead of stacking listeners", () => 
   assert.deepEqual(killed, [0, 1]);
 });
 
+test("reports helper stderr when native toast fails before emitting a result", async () => {
+  let onStderr: ((chunk: Buffer) => void) | undefined;
+  let onClose: (() => void) | undefined;
+  const events: string[] = [];
+  const child = {
+    stdin: { on() {} },
+    stdout: { on() {} },
+    stderr: { on(_event: string, cb: (chunk: Buffer) => void) { onStderr = cb; } },
+    once(event: string, cb: () => void) { if (event === "close") onClose = cb; },
+    kill() {},
+    removeAllListeners() {},
+  };
+  const toast = new NativeToast(
+    () => {},
+    () => {},
+    (result) => events.push(result),
+    () => "X:/fake.exe",
+    (() => {
+      setTimeout(() => { onStderr?.(Buffer.from("error: toast failed\n")); onClose?.(); }, 0);
+      return child;
+    }) as unknown as typeof spawn,
+  );
+
+  assert.equal(toast.show("t", "m", { appID: "Pi.AgentToast" }), true);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(events, ["failed: error: toast failed"]);
+});
+
+test("keeps the current helper if replacement spawn fails", () => {
+  let calls = 0;
+  const killed: number[] = [];
+  const errors: Error[] = [];
+  const toast = new NativeToast(
+    () => {},
+    (error) => errors.push(error),
+    undefined,
+    () => "X:/fake.exe",
+    (() => {
+      const id = calls++;
+      if (id === 1) throw new Error("spawn failed");
+      return {
+        stdin: { on() {} },
+        stdout: { on() {} },
+        once() {},
+        kill() { killed.push(id); },
+        removeAllListeners() {},
+      };
+    }) as unknown as typeof spawn,
+  );
+
+  assert.equal(toast.show("first", "one", { appID: "Pi.AgentToast" }), true);
+  assert.equal(toast.show("second", "two", { appID: "Pi.AgentToast" }), false);
+  assert.equal(errors[0]?.message, "spawn failed");
+  assert.deepEqual(killed, []);
+  toast.close();
+  assert.deepEqual(killed, [0]);
+});
+
 test("dispose ends the helper's stdin lifeline instead of killing it and refuses new toasts", () => {
   const calls: string[] = [];
   let options: { stdio?: unknown; detached?: boolean } = {};
@@ -247,7 +305,7 @@ test("dispose ends the helper's stdin lifeline instead of killing it and refuses
   assert.equal(toast.show("t", "m", { appID: "Pi.AgentToast" }), true);
   // 辅助程序靠 stdin 断开判断会话结束（-Lifeline stdin），所以 stdin 必须是管道；
   // 还得 detached，否则 pi 退出时 libuv 的 job 会连它一起杀掉，来不及撤通知
-  assert.deepEqual(options.stdio, ["pipe", "pipe", "ignore"]);
+  assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe"]);
   assert.equal(options.detached, true);
 
   // 不能 kill：被杀掉的辅助程序没机会把通知中心里的条目撤掉

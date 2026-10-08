@@ -76,7 +76,7 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-07-reply-ready";
+const BUILD_TAG = "2026-10-08-native-toast-reliability";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -107,6 +107,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
   let busUnsubscribers: Array<() => void> = [];
   let unsubTerminalInput: (() => void) | undefined;
   let lastAutomatic: { signature: string; at: number } | undefined;
+  let pendingNative: { eventKey: string; title: string; message: string; notify: NotifyConfig; force: boolean } | undefined;
+  let nativeHelperBuildPending = false;
   const pendingManual = new Map<string, ManualNotification>();
   const reported = new Set<string>();
 
@@ -200,12 +202,21 @@ export default function clickableToast(pi: ExtensionAPI): void {
     if (!origin || !controller) return false;
     if (!force && shouldSilenceNative(notify, eventKey, lastInputAt)) return false;
     if (!force && notify.native.suppressWhenFocused && await isWindowForeground(origin.hwnd)) return false;
+    if (!nativeToastReady) {
+      if (nativeHelperBuildPending) {
+        pendingNative = { eventKey, title, message, notify, force };
+        debugLog(`queue: native helper not ready event=${eventKey}`);
+        return true;
+      }
+      reportOnce("toast-channel", "native toast unavailable; the notification was not shown");
+      return false;
+    }
     const clickable = readConfig()?.clickable;
     const appearance = clickable ? await resolveAppearance(clickable, notify) : {};
     debugLog(`show: event=${eventKey} title=${JSON.stringify(title)} appID=${appearance.appID ?? "default"} icon=${appearance.icon ?? "-"}`);
     const body = clickable?.showSource ? appendSource(message, origin) : message;
     // 只用 WinRT 通道：SnoreToast 在带应用标识时收不到点击，而没应用的 toast 名字就叫 SnoreToast。
-    const shown = nativeToastReady && controller.show(title, body, { ...appearance, tag: originWideTag() });
+    const shown = controller.show(title, body, { ...appearance, tag: originWideTag() });
     if (!shown) reportOnce("toast-channel", "native toast unavailable; the notification was not shown");
     return shown;
   };
@@ -288,6 +299,9 @@ export default function clickableToast(pi: ExtensionAPI): void {
     lastInputAt = 0;
     lastKeyAt = 0;
     lastRun = undefined;
+    pendingNative = undefined;
+    nativeToastReady = false;
+    nativeHelperBuildPending = false;
     reported.clear();
     pendingManual.clear();
     disarmRenotify();
@@ -301,13 +315,22 @@ export default function clickableToast(pi: ExtensionAPI): void {
     }
     origin = createOrigin(ctx.cwd);
     debugLog(`session_start: build=${BUILD_TAG} mode=${ctx.mode} herdrPane=${origin.herdrPaneId ?? "-"} cwd=${ctx.cwd}`);
-    // 后台编译原生辅助程序（仅首次，约 0.7 秒）；就绪前发的 toast 会被跳过并提示。
+    // 后台编译原生辅助程序（仅首次，约 0.7 秒）；就绪前只缓存最后一条 toast。
     controller = new NativeToast(activateOrigin, (error) => reportOnce("toast", error.message), onToastEvent);
+    nativeHelperBuildPending = true;
     void buildNativeHelper().then((ok) => {
+      nativeHelperBuildPending = false;
       nativeToastReady = ok;
       debugLog(`native helper: ${ok ? "ready" : "unavailable, toast disabled"}`);
+      if (!ok) {
+        pendingNative = undefined;
+        return;
+      }
       // 窗口句柄要靠辅助程序捕获，所以等它就绪再取；之后每次输入还会再取一次。
-      if (ok) void refreshWindowHandle();
+      void refreshWindowHandle();
+      const pending = pendingNative;
+      pendingNative = undefined;
+      if (pending) void showNative(pending.eventKey, pending.title, pending.message, pending.notify, pending.force);
     });
     registerBusListeners();
 
@@ -315,6 +338,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
     // 回答提问不会触发 agent_start，不在这里取消的话，问题答完后重复提醒还会接着弹。
     unsubTerminalInput = ctx.ui.onTerminalInput(() => {
       lastKeyAt = Date.now();
+      pendingNative = undefined;
       if (renotifyTimer !== undefined) {
         debugLog("renotify: cancelled by terminal input");
         disarmRenotify();
@@ -342,6 +366,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
   pi.on("agent_start", () => {
     disarmRenotify();
     lastRun = undefined;
+    pendingNative = undefined;
   });
   pi.on("agent_end", (event) => {
     lastRun = runOutcome(event.messages);
@@ -406,6 +431,9 @@ export default function clickableToast(pi: ExtensionAPI): void {
     }
     busUnsubscribers = [];
     pendingManual.clear();
+    pendingNative = undefined;
+    nativeHelperBuildPending = false;
+    nativeToastReady = false;
     controller?.dispose();
     controller = undefined;
     origin = undefined;
