@@ -76,7 +76,7 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
 }
 
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-08-native-toast-reliability";
+const BUILD_TAG = "2026-10-12-completion-idle-check";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -107,8 +107,10 @@ export default function clickableToast(pi: ExtensionAPI): void {
   let busUnsubscribers: Array<() => void> = [];
   let unsubTerminalInput: (() => void) | undefined;
   let lastAutomatic: { signature: string; at: number } | undefined;
-  let pendingNative: { eventKey: string; title: string; message: string; notify: NotifyConfig; force: boolean } | undefined;
+  let pendingNative: { eventKey: string; title: string; message: string; notify: NotifyConfig; force: boolean; completionVersion?: number } | undefined;
   let nativeHelperBuildPending = false;
+  let completionTimer: ReturnType<typeof setTimeout> | undefined;
+  let completionVersion = 0;
   const pendingManual = new Map<string, ManualNotification>();
   const reported = new Set<string>();
 
@@ -139,6 +141,17 @@ export default function clickableToast(pi: ExtensionAPI): void {
     if (renotifyTimer !== undefined) clearInterval(renotifyTimer);
     renotifyTimer = undefined;
   };
+
+  const cancelCompletion = (): void => {
+    if (completionTimer !== undefined) clearTimeout(completionTimer);
+    completionTimer = undefined;
+    completionVersion += 1;
+    pendingNative = undefined;
+  };
+
+  // agent_settled 之后，目标扩展仍可能用定时器续跑；异步查询和图标生成也不能带出上一轮的通知。
+  const completionIsCurrent = (version: number): boolean =>
+    version === completionVersion && context?.isIdle() === true && !context.hasPendingMessages();
 
   const refreshWindowHandle = async (): Promise<void> => {
     const target = origin;
@@ -198,13 +211,16 @@ export default function clickableToast(pi: ExtensionAPI): void {
     message: string,
     notify: NotifyConfig,
     force = false,
+    version?: number,
   ): Promise<boolean> => {
     if (!origin || !controller) return false;
+    if (version !== undefined && !completionIsCurrent(version)) return false;
     if (!force && shouldSilenceNative(notify, eventKey, lastInputAt)) return false;
     if (!force && notify.native.suppressWhenFocused && await isWindowForeground(origin.hwnd)) return false;
+    if (version !== undefined && !completionIsCurrent(version)) return false;
     if (!nativeToastReady) {
       if (nativeHelperBuildPending) {
-        pendingNative = { eventKey, title, message, notify, force };
+        pendingNative = { eventKey, title, message, notify, force, completionVersion: version };
         debugLog(`queue: native helper not ready event=${eventKey}`);
         return true;
       }
@@ -213,6 +229,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
     }
     const clickable = readConfig()?.clickable;
     const appearance = clickable ? await resolveAppearance(clickable, notify) : {};
+    if (version !== undefined && !completionIsCurrent(version)) return false;
     debugLog(`show: event=${eventKey} title=${JSON.stringify(title)} appID=${appearance.appID ?? "default"} icon=${appearance.icon ?? "-"}`);
     const body = clickable?.showSource ? appendSource(message, origin) : message;
     // 只用 WinRT 通道：SnoreToast 在带应用标识时收不到点击，而没应用的 toast 名字就叫 SnoreToast。
@@ -250,7 +267,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
     renotifyTimer.unref?.();
   };
 
-  const handleAutomatic = async (eventKey: KnownEvent, payload: unknown): Promise<void> => {
+  const handleAutomatic = async (eventKey: KnownEvent, payload: unknown, version?: number): Promise<void> => {
     const loaded = readConfig();
     if (!loaded?.clickable.enabled || !autoEventUsesNative(loaded.notify, eventKey)) return;
     let notificationPayload: unknown = payload;
@@ -269,14 +286,36 @@ export default function clickableToast(pi: ExtensionAPI): void {
       }
     }
 
+    if (version !== undefined && !completionIsCurrent(version)) {
+      debugLog(`skip: ${eventKey}, agent continued during notification preparation`);
+      return;
+    }
+
     const notification = buildEventNotification(eventKey, notificationPayload, pi.getSessionName?.());
     const signature = `${eventKey}\0${notification.message}`;
     const now = Date.now();
     if (lastAutomatic?.signature === signature && now - lastAutomatic.at < 750) return;
     lastAutomatic = { signature, at: now };
 
-    await showNative(eventKey, notification.title, notification.message, loaded.notify);
+    await showNative(eventKey, notification.title, notification.message, loaded.notify, false, version);
     armRenotify(eventKey, notification.title, notification.message);
+  };
+
+  const scheduleCompletion = (eventKey: "agent_end" | "agent_settled", outcome: RunOutcome | undefined): void => {
+    const loaded = readConfig();
+    if (!origin || !loaded?.clickable.enabled || !autoEventUsesNative(loaded.notify, eventKey)) return;
+    cancelCompletion();
+    const version = completionVersion;
+    // 给 agent_settled 的其他监听器留出续跑时间；最终回复只增加半秒延迟，提问不经过这里。
+    completionTimer = setTimeout(() => {
+      completionTimer = undefined;
+      if (!completionIsCurrent(version)) {
+        debugLog(`skip: ${eventKey}, agent is still working or has queued messages`);
+        return;
+      }
+      void handleAutomatic(eventKey, outcome, version);
+    }, 500);
+    completionTimer.unref?.();
   };
 
   const registerBusListeners = (): void => {
@@ -299,7 +338,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
     lastInputAt = 0;
     lastKeyAt = 0;
     lastRun = undefined;
-    pendingNative = undefined;
+    cancelCompletion();
+    lastAutomatic = undefined;
     nativeToastReady = false;
     nativeHelperBuildPending = false;
     reported.clear();
@@ -330,7 +370,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
       void refreshWindowHandle();
       const pending = pendingNative;
       pendingNative = undefined;
-      if (pending) void showNative(pending.eventKey, pending.title, pending.message, pending.notify, pending.force);
+      if (pending) void showNative(pending.eventKey, pending.title, pending.message, pending.notify, pending.force, pending.completionVersion);
     });
     registerBusListeners();
 
@@ -359,6 +399,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
 
   pi.on("input", (event) => {
     if (event.source !== "interactive") return;
+    cancelCompletion();
     lastInputAt = Date.now();
     void refreshWindowHandle();
   });
@@ -366,14 +407,15 @@ export default function clickableToast(pi: ExtensionAPI): void {
   pi.on("agent_start", () => {
     disarmRenotify();
     lastRun = undefined;
-    pendingNative = undefined;
+    cancelCompletion();
+    lastAutomatic = undefined;
   });
   pi.on("agent_end", (event) => {
     lastRun = runOutcome(event.messages);
-    void handleAutomatic("agent_end", lastRun);
+    scheduleCompletion("agent_end", lastRun);
   });
-  // 自动重试、压缩续跑都结束后才触发，这时最近一次 agent_end 的结果就是最终结果
-  pi.on("agent_settled", () => void handleAutomatic("agent_settled", lastRun));
+  // Pi 的自动恢复结束后，还要等扩展的定时续跑；开始新一轮就撤销待发的完成通知。
+  pi.on("agent_settled", () => scheduleCompletion("agent_settled", lastRun));
 
   pi.on("tool_call", (event: ToolCallEvent) => {
     if (event.toolName !== "notify_user") return;
@@ -431,7 +473,7 @@ export default function clickableToast(pi: ExtensionAPI): void {
     }
     busUnsubscribers = [];
     pendingManual.clear();
-    pendingNative = undefined;
+    cancelCompletion();
     nativeHelperBuildPending = false;
     nativeToastReady = false;
     controller?.dispose();
