@@ -3,14 +3,16 @@
 // milliseconds, where a PowerShell script needed 1.1-1.8 s per call for the same work.
 //
 // CLI:   PiToastFocus.exe -Action <name> -Value <number>
-//   capture <pid>     print the first ancestor window handle of <pid>        (exit 2: none)
+//   capture <pid>     print the terminal window hosting <pid>'s console (Windows Terminal / conhost), else the
+//                     first ancestor window handle of <pid>                       (exit 2: none)
 //   focus <hwnd>      bring a top-level window to the foreground and verify   (exit 3: refused)
 //   foreground <hwnd> print True/False: is the window already in the foreground
 //   herdr-focus 1     raise the Windows Terminal window hosting the Herdr UI and select its tab
 //                     (stdout: "<hwnd> via=<method> tab=<state>", exit 2: no herdr UI window)
 //   icon              draw a rounded-square project icon: -Text <1-2 chars> -Color <RRGGBB> -Out <png path>
 //   toast             show a toast that reports clicks: -Title, -Message, -AppID, [-Icon png], [-Tag t],
-//                     [-ParentPid pid], [-Lifeline stdin]
+//                     [-ParentPid pid], [-Lifeline stdin], [-SoundPath file | -Silent true], [-DryRun true]
+//                     (-DryRun prints the toast XML instead of showing it; used by the tests)
 //                     (stdout: activated | dismissed | failed | timeout | closed | orphan; stays alive for
 //                      clicks from the notification centre too, exit code 0 only on activated)
 //
@@ -47,6 +49,8 @@ internal static class Native
 
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -77,6 +81,8 @@ internal static class Native
 internal static class Program
 {
     private static string focusVia = "none";
+    // Formats Windows toasts can play; anything else is not even offered to the shell.
+    private static readonly string[] SoundExtensions = { ".aac", ".flac", ".m4a", ".mp3", ".wav", ".wma" };
 
     private static int Main(string[] args)
     {
@@ -121,7 +127,7 @@ internal static class Program
                     Console.Out.Write(Native.GetForegroundWindow() == new IntPtr(value) ? "True" : "False");
                     return 0;
                 case "focus":
-                    if (FocusWindow(new IntPtr(value))) return 0;
+                    if (FocusTerminalWindow(new IntPtr(value))) return 0;
                     Console.Error.WriteLine("focus failed: target=" + value + " foreground=" + Native.GetForegroundWindow().ToInt64());
                     return 3;
                 case "herdr-focus": return HerdrFocus();
@@ -200,13 +206,40 @@ internal static class Program
         return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
     }
 
+    // The <audio> element: silent wins; a usable local file becomes a file:/// URI (Uri escapes spaces, '#',
+    // '%' and non-ASCII); anything else yields "" so Windows plays the default notification sound.
+    private static string AudioXml(string soundPath, string silent)
+    {
+        if (string.Equals(silent, "true", StringComparison.OrdinalIgnoreCase)) return "<audio silent=\"true\"/>";
+        if (string.IsNullOrEmpty(soundPath)) return "";
+        try
+        {
+            if (!Path.IsPathRooted(soundPath) || !File.Exists(soundPath)) return "";
+            if (Array.IndexOf(SoundExtensions, Path.GetExtension(soundPath).ToLowerInvariant()) < 0) return "";
+            return "<audio src=\"" + XmlEscape(new Uri(soundPath).AbsoluteUri) + "\"/>";
+        }
+        catch (Exception) { return ""; }
+    }
+
+    private static XmlDocument ToastXml(string title, string message, string image, string audio)
+    {
+        XmlDocument xml = new XmlDocument();
+        xml.LoadXml(
+            "<toast><visual><binding template=\"ToastGeneric\">" +
+            "<text>" + XmlEscape(title) + "</text>" +
+            "<text>" + XmlEscape(message) + "</text>" +
+            image +
+            "</binding></visual>" + audio + "</toast>");
+        return xml;
+    }
+
     // Windows keeps a toast in the action centre for hours, so a click can arrive long after the banner
     // disappeared. Stay alive for either event; only a user-close, the end of the pi session, or a very
     // long deadline ends the wait. If the session ends first nobody is left to handle a click, so take the
     // toast out of the action centre instead of leaving a dead entry behind.
     private static int ShowToast(Dictionary<string, string> opts)
     {
-        string title, message, appId, icon, tag, rawParent, lifeline;
+        string title, message, appId, icon, tag, rawParent, lifeline, soundPath, silent, dryRun;
         opts.TryGetValue("Title", out title);
         opts.TryGetValue("Message", out message);
         opts.TryGetValue("AppID", out appId);
@@ -214,6 +247,9 @@ internal static class Program
         opts.TryGetValue("Tag", out tag);
         opts.TryGetValue("ParentPid", out rawParent);
         opts.TryGetValue("Lifeline", out lifeline);
+        opts.TryGetValue("SoundPath", out soundPath);
+        opts.TryGetValue("Silent", out silent);
+        opts.TryGetValue("DryRun", out dryRun);
         int parentPid = 0;
         if (!string.IsNullOrEmpty(rawParent)) int.TryParse(rawParent, out parentPid);
         if (string.IsNullOrEmpty(appId)) return 1;
@@ -221,13 +257,21 @@ internal static class Program
         string image = string.IsNullOrEmpty(icon)
             ? ""
             : "<image placement=\"appLogoOverride\" hint-crop=\"square\" src=\"" + XmlEscape(new Uri(icon).AbsoluteUri) + "\"/>";
-        XmlDocument xml = new XmlDocument();
-        xml.LoadXml(
-            "<toast><visual><binding template=\"ToastGeneric\">" +
-            "<text>" + XmlEscape(title) + "</text>" +
-            "<text>" + XmlEscape(message) + "</text>" +
-            image +
-            "</binding></visual></toast>");
+        // An unusable sound must never cost us the notification: build with the requested audio first and
+        // fall back to the plain (system default sound) toast if the shell rejects the XML.
+        string audio = AudioXml(soundPath, silent);
+        XmlDocument xml;
+        try { xml = ToastXml(title, message, image, audio); }
+        catch (Exception)
+        {
+            if (audio.Length == 0) throw;
+            xml = ToastXml(title, message, image, "");
+        }
+        if (string.Equals(dryRun, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Out.Write(xml.GetXml());
+            return 0;
+        }
 
         ToastNotification toast = new ToastNotification(xml);
         if (!string.IsNullOrEmpty(tag)) toast.Tag = tag;
@@ -238,18 +282,36 @@ internal static class Program
         string result = null;
         // first outcome wins: a click that races the end of the session still reports "activated"
         Action<string> finish = r => { lock (gate) { if (result == null) result = r; } done.Set(); };
-        toast.Activated += (s, e) => finish("activated");
-        toast.Dismissed += (s, e) =>
+        Action<ToastNotification> attachEvents = current =>
         {
-            // TimedOut only means the banner left the screen; the notification is still clickable in the
-            // action centre, so keep waiting (this is the common case: the user clicks it later).
-            if (e.Reason == ToastDismissalReason.TimedOut) return;
-            finish("dismissed");
+            current.Activated += (s, e) => finish("activated");
+            current.Dismissed += (s, e) =>
+            {
+                // TimedOut only means the banner left the screen; the notification is still clickable in the
+                // action centre, so keep waiting (this is the common case: the user clicks it later).
+                if (e.Reason == ToastDismissalReason.TimedOut) return;
+                finish("dismissed");
+            };
+            current.Failed += (s, e) => finish("failed");
         };
-        toast.Failed += (s, e) => finish("failed");
+        attachEvents(toast);
 
         ToastNotifier notifier = ToastNotificationManager.CreateToastNotifier(appId);
-        notifier.Show(toast);
+        try
+        {
+            notifier.Show(toast);
+        }
+        catch (Exception)
+        {
+            // A malformed/unsupported custom audio URI must not suppress the notification itself.
+            if (audio.Length == 0) throw;
+            xml = ToastXml(title, message, image, "");
+            toast = new ToastNotification(xml);
+            if (!string.IsNullOrEmpty(tag)) toast.Tag = tag;
+            toast.ExpirationTime = DateTimeOffset.Now.AddHours(12);
+            attachEvents(toast);
+            notifier.Show(toast);
+        }
 
         // -Lifeline stdin: pi holds our stdin open and never writes to it, so EOF means its session is over
         // (exit, /reload, crash or a closed terminal alike) - right away, unlike the parent poll below.
@@ -293,7 +355,7 @@ internal static class Program
         catch (ArgumentException) { return false; }
     }
 
-    // ---- capture: first ancestor process that owns a top-level window ---------------------------
+    // ---- capture: follow the parent process chain to the owning terminal window ------------------
 
     private static Dictionary<int, int> ParentMap()
     {
@@ -315,24 +377,86 @@ internal static class Program
         return map;
     }
 
+    private static string WindowClass(IntPtr h)
+    {
+        StringBuilder name = new StringBuilder(128);
+        Native.GetClassNameW(h, name, 128);
+        return name.ToString();
+    }
+
+    private static bool IsTerminalWindow(IntPtr h)
+    {
+        if (h == IntPtr.Zero || !Native.IsWindow(h)) return false;
+        string cls = WindowClass(h);
+        return cls == "CASCADIA_HOSTING_WINDOW_CLASS" || cls == "ConsoleWindowClass";
+    }
+
+    private static IntPtr ConsoleWindowForProcess(int pid)
+    {
+        Native.FreeConsole();
+        try
+        {
+            if (!Native.AttachConsole((uint)pid)) return IntPtr.Zero;
+            return Native.GetConsoleWindow();
+        }
+        finally { Native.FreeConsole(); }
+    }
+
+    private static IntPtr TerminalWindowForProcess(int pid)
+    {
+        try
+        {
+            using (Process p = Process.GetProcessById(pid))
+            {
+                IntPtr main = p.MainWindowHandle;
+                if (IsTerminalWindow(main)) return main;
+            }
+        }
+        catch (ArgumentException) { }
+
+        // Windows Terminal often gives the shell a zero MainWindowHandle; attach to its console and
+        // resolve the owning Cascadia window instead of guessing from the currently active window.
+        IntPtr console = ConsoleWindowForProcess(pid);
+        IntPtr owner = Native.GetWindow(console, 4); // GW_OWNER
+        if (IsTerminalWindow(owner)) return owner;
+        return IsTerminalWindow(console) ? console : IntPtr.Zero;
+    }
+
     private static int Capture(int pid)
     {
         Dictionary<int, int> parents = ParentMap();
+        IntPtr fallback = IntPtr.Zero;
         int current = pid;
         for (int depth = 0; depth < 24 && current > 0; depth++)
         {
-            try
+            IntPtr hwnd = TerminalWindowForProcess(current);
+            if (hwnd != IntPtr.Zero)
             {
-                using (Process p = Process.GetProcessById(current))
-                {
-                    long hwnd = p.MainWindowHandle.ToInt64();
-                    if (hwnd != 0) { Console.Out.Write(hwnd.ToString()); return 0; }
-                }
+                Console.Out.Write(hwnd.ToInt64().ToString());
+                return 0;
             }
-            catch (ArgumentException) { }
+            // Prefer a real terminal window; keep the first ancestor MainWindowHandle as a last resort
+            // for hosts that are not Windows Terminal (VS Code, etc.). Never use the active window.
+            if (fallback == IntPtr.Zero)
+            {
+                try
+                {
+                    using (Process p = Process.GetProcessById(current))
+                    {
+                        IntPtr main = p.MainWindowHandle;
+                        if (main != IntPtr.Zero && Native.IsWindow(main)) fallback = main;
+                    }
+                }
+                catch (ArgumentException) { }
+            }
             int next;
-            if (!parents.TryGetValue(current, out next)) break;
+            if (!parents.TryGetValue(current, out next) || next == current) break;
             current = next;
+        }
+        if (fallback != IntPtr.Zero)
+        {
+            Console.Out.Write(fallback.ToInt64().ToString());
+            return 0;
         }
         return 2;
     }
@@ -353,6 +477,15 @@ internal static class Program
     // Windows refuses SetForegroundWindow from a background process for 200 s after the last user
     // input (foreground lock), which is exactly the state right after clicking a toast. Try the known
     // bypasses, cheapest first, and only report success when the window really is in the foreground.
+    // Ordinary Windows Terminal / conhost: restore if minimized, then reuse the lock-bypass sequence.
+    // Never consult GetForegroundWindow() to pick a target — that would steal whatever is currently active.
+    private static bool FocusTerminalWindow(IntPtr h)
+    {
+        if (h == IntPtr.Zero || !Native.IsWindow(h)) return false;
+        if (Native.IsIconic(h)) Native.ShowWindow(h, 9); // SW_RESTORE
+        return FocusWindow(h);
+    }
+
     private static bool FocusWindow(IntPtr h)
     {
         if (Native.IsIconic(h)) Native.ShowWindow(h, 9); // SW_RESTORE

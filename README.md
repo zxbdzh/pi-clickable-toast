@@ -7,7 +7,7 @@
 - **接管全部 native toast**：自动事件（`agent_end`、`workflow_end`、`ask_user_prompt` 等）和手动 `notify_user` 的 native 通道都由本扩展发送
 - **点击回来源**：
   - Herdr 环境（`HERDR_ENV=1`）→ `herdr agent focus <HERDR_PANE_ID>` 精确聚焦对应 pane
-  - 普通 Windows Terminal → 原生辅助程序沿父进程链捕获 `MainWindowHandle`，点击时恢复/前置窗口（窗口级）
+  - 普通 Windows Terminal → 原生辅助程序沿父进程链识别 `CASCADIA_HOSTING_WINDOW_CLASS` / `ConsoleWindowClass`，点击时恢复并前置捕获的窗口（窗口级）
 - **每会话仅最新一条**：新 toast 顶替旧的，不堆叠
 - **会话结束即撤通知**：pi 退出、`/reload`、崩溃或终端被关后，它留在通知中心的那条 toast 会被撤掉（这时已没有进程接收点击，留着点了也没反应）。原理：pi 把辅助程序的 stdin 当生命线，会话一结束管道就断，辅助程序收到 EOF 后撤下自己显示的 toast 再退出；辅助程序以 detached 方式启动，否则 pi 一退出它就被 Node 的 job 一起杀掉，来不及撤
 - **只在交互终端里自动通知**：magic-context 等扩展会在后台起 `pi --mode json/rpc` 子进程，它们也加载本扩展；这些进程不发自动通知（否则会弹出不属于你的 “Agent Run Complete”，且子进程退出后点了没反应）
@@ -50,6 +50,7 @@ pi install F:\github\pi-clickable-toast   # 本地路径安装，原地加载，
 | `projectIcon` | `true` | 用项目名生成正文左侧的大图（首字母 + 固定颜色） |
 | `icon` | 空 | 自定义图标路径（png/jpg/ico），相对路径按 `%USERPROFILE%\.pi\agent` 解析；填了就不用项目图标 |
 | `appName` | `Pi` | toast 左上角显示的应用名 |
+| `sound` | 未配置 | 音效配置。可写本地音频路径（相对路径按 `%USERPROFILE%\.pi\agent` 解析），或写字符串 `"silent"` 静音；支持 `.aac`、`.flac`、`.m4a`、`.mp3`、`.wav`、`.wma`。文件不存在、是目录或扩展名不支持时回退系统默认音效，并提示一次。路径中的空格、`#`、`%` 会由原生 helper 正确转成 `file:///` URI。 |
 
 以上字段都是热生效，改完下一条通知就变，不需要重启 pi。
 
@@ -71,7 +72,7 @@ pi install F:\github\pi-clickable-toast   # 本地路径安装，原地加载，
 点击 toast 会切回通知的来源：
 
 - **Herdr**：找到 Herdr 界面所在的 Windows Terminal 窗口并切到前台，必要时切到它所在的标签页，然后 `herdr agent focus <pane>` 切到对应 pane。找不到任何 Herdr 界面窗口时，新开一个窗口执行 `herdr session attach`。
-- **普通终端**：把来源终端窗口切到前台（窗口级，不定位到标签页）。
+- **普通终端**：把来源终端窗口切到前台（窗口级，不定位到标签页）。目标句柄在 toast 发送前沿父进程链捕获并缓存，点击时不会依赖当前活动窗口。`HERDR_ENV=1` 时完全跳过这条路径。
 
 宿主终端在其他标签页、被其他窗口遮住、或已最小化时都能切回。Windows 在前一次用户输入后的 200 秒内会拒绝后台进程抢前台，扩展会依次尝试几种绕过手段，并且只在真的切到前台后才报告成功。
 
@@ -82,7 +83,7 @@ toast 的显示和点击接收、点击后的定位都走一个约 16 KB 的原�
 ## 测试
 
 ```powershell
-npm test          # 单元测试（core/windows 逻辑）
+npm test          # 单元测试（配置、音效 XML、窗口聚焦、Herdr 路由）
 npm run smoke:rpc # 端到端冒烟：spawn RPC 模式 pi → 发测试 toast → 退出 pi → 验证辅助程序已退出、通知已从通知中心撤掉
 ```
 

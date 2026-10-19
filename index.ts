@@ -4,9 +4,9 @@ import type {
   ToolCallEvent,
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { extname, isAbsolute, join, resolve } from "node:path";
 import {
   KNOWN_EVENTS,
   appendSource,
@@ -75,8 +75,27 @@ function resolveIcon(configured: string | undefined): { path: string; missing?: 
   return existsSync(path) ? { path } : { path: DEFAULT_ICON, missing: path };
 }
 
+
+/** 解析本地音效；无效配置只回退到系统默认音效，不阻断 toast。 */
+export function resolveSound(configured: ClickableConfig["sound"]): { path?: string; silent?: boolean; missing?: string } {
+  if (!configured) return {};
+  if (configured.silent) return { silent: true };
+  if (!configured.path) return {};
+  const path = isAbsolute(configured.path)
+    ? configured.path
+    : resolve(join(homedir(), ".pi", "agent"), configured.path);
+  try {
+    if (!existsSync(path) || !statSync(path).isFile()) return { missing: path };
+    // Windows Toast 只保证这些格式；其他扩展名交给系统尝试时容易让整条通知失败。
+    const supported = new Set([".aac", ".flac", ".m4a", ".mp3", ".wav", ".wma"]);
+    if (!supported.has(extname(path).toLowerCase())) return { missing: path };
+    return { path };
+  } catch {
+    return { missing: path };
+  }
+}
 // 换了行为就改这个标记，日志里一眼能看出运行的是不是新代码
-const BUILD_TAG = "2026-10-12-completion-idle-check";
+const BUILD_TAG = "2026-10-12-sound-and-wt-focus";
 const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "clickable-toast.log");
 
 /** 仅在 clickable-toast.json 的 debug=true 时写日志；日志失败不能影响通知。 */
@@ -183,6 +202,8 @@ export default function clickableToast(pi: ExtensionAPI): void {
   ): Promise<ToastAppearance> => {
     // 自定义图标优先；否则可选按项目名生成；都不可用时用自带图标
     const custom = resolveIcon(clickable.icon);
+    const sound = resolveSound(clickable.sound);
+    if (sound.missing) reportOnce("sound", `sound file not found or unsupported, using the system default: ${sound.missing}`);
     if (custom.missing) reportOnce("icon", `icon not found, using the project icon: ${custom.missing}`);
     let icon = clickable.icon ? custom.path : DEFAULT_ICON;
     if (!clickable.icon && clickable.projectIcon && origin) {
@@ -192,7 +213,13 @@ export default function clickableToast(pi: ExtensionAPI): void {
 
     // notify 配置里显式指定了 windowsAppId 就按用户的来，不由我们登记。
     // 应用标识只含名字（不含图标路径）：图标每次生成后是同路径的，没必要让注册失效。
-    if (notify.native.windowsAppId) return { appID: notify.native.windowsAppId, icon };
+    if (notify.native.windowsAppId) {
+      return {
+        appID: notify.native.windowsAppId,
+        icon,
+        ...(sound.silent ? { sound: { silent: true } } : sound.path ? { sound: { path: sound.path } } : {}),
+      };
+    }
     const key = clickable.appName;
     if (appRegistration?.key !== key) {
       appRegistration = {
@@ -202,7 +229,11 @@ export default function clickableToast(pi: ExtensionAPI): void {
     }
     const registered = await appRegistration.done;
     if (!registered) reportOnce("app-id", "could not register the toast app identity; using the default one");
-    return { ...(registered ? { appID: TOAST_APP_ID } : {}), icon };
+    return {
+      ...(registered ? { appID: TOAST_APP_ID } : {}),
+      icon,
+      ...(sound.silent ? { sound: { silent: true } } : sound.path ? { sound: { path: sound.path } } : {}),
+    };
   };
 
   const showNative = async (

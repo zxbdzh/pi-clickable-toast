@@ -350,13 +350,38 @@ export interface ClickableConfig {
   appName: string;
   /** 自定义图标（png/jpg/ico 路径），缺省用扩展自带的图标。 */
   icon?: string;
+  /** 通知音效：本地音频文件路径，或 "silent" 静音；缺省使用系统默认音效。 */
+  sound?: ClickableSound;
 }
 
 export const DEFAULT_APP_NAME = "Pi";
 
+/** clickable-toast.json 中可选的通知音效；path 与 silent 同时存在时静音优先。 */
+export interface ClickableSound {
+  path?: string;
+  silent?: boolean;
+}
+
+function normalizeClickableSound(value: unknown): ClickableSound | undefined {
+  if (typeof value === "string") {
+    const configured = text(value);
+    if (!configured) return undefined;
+    return configured.toLowerCase() === "silent" ? { silent: true } : { path: configured };
+  }
+  const raw = record(value);
+  const path = text(raw.path);
+  const silent = raw.silent === true;
+  if (!path && !silent) return undefined;
+  return {
+    ...(path ? { path } : {}),
+    ...(silent ? { silent: true } : {}),
+  };
+}
+
 export function normalizeClickableConfig(raw: unknown): ClickableConfig {
   const value = (raw !== null && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const icon = text(value.icon);
+  const sound = normalizeClickableSound(value.sound);
   return {
     enabled: value.enabled !== false,
     debug: value.debug === true,
@@ -364,6 +389,7 @@ export function normalizeClickableConfig(raw: unknown): ClickableConfig {
     projectIcon: value.projectIcon !== false,
     appName: text(value.appName) ?? DEFAULT_APP_NAME,
     ...(icon ? { icon } : {}),
+    ...(sound ? { sound } : {}),
   };
 }
 

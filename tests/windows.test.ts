@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { projectIconSpec, type Origin } from "../core.ts";
+import { resolveSound } from "../index.ts";
 import {
   NativeToast,
   buildNativeHelper,
@@ -140,6 +141,102 @@ test("passes identity, icon and tag to the native toast helper", () => {
     "-AppID", "Pi.AgentToast", "-ParentPid", String(process.pid), "-Lifeline", "stdin",
     "-Icon", "C:/i.png", "-Tag", "pi-1",
   ]);
+});
+
+test("passes the custom sound or silence to the helper and omits it by default", () => {
+  const spawned: Array<readonly string[]> = [];
+  const make = () =>
+    new NativeToast(
+      () => {},
+      () => {},
+      undefined,
+      () => "X:/fake/PiToastFocus.exe",
+      ((_file: string, args: readonly string[]) => {
+        spawned.push(args);
+        return { stdout: { on() {} }, once() {}, kill() {}, removeAllListeners() {} };
+      }) as unknown as typeof spawn,
+    );
+
+  make().show("t", "m", { appID: "Pi.AgentToast", sound: { path: "D:/My Sounds/a#b.wav" } });
+  make().show("t", "m", { appID: "Pi.AgentToast", sound: { silent: true } });
+  make().show("t", "m", { appID: "Pi.AgentToast" });
+
+  // 路径原样交给 helper，由它转成 file:/// URI；不在 Node 侧拼 URI，避免双重转义
+  assert.deepEqual(spawned[0].slice(-2), ["-SoundPath", "D:/My Sounds/a#b.wav"]);
+  assert.deepEqual(spawned[1].slice(-2), ["-Silent", "true"]);
+  assert.ok(!spawned[2].includes("-SoundPath") && !spawned[2].includes("-Silent"));
+});
+
+test("resolveSound uses only existing supported audio files and never throws", () => {
+  const dir = mkdtempSync(join(tmpdir(), "clickable-toast-sound-"));
+  try {
+    const wav = join(dir, "ding dong#1.wav");
+    const txt = join(dir, "notes.txt");
+    const folder = join(dir, "folder.wav");
+    writeFileSync(wav, "RIFF");
+    writeFileSync(txt, "x");
+    mkdirSync(folder);
+
+    assert.deepEqual(resolveSound(undefined), {});
+    assert.deepEqual(resolveSound({}), {});
+    assert.deepEqual(resolveSound({ path: wav }), { path: wav });
+    // 静音优先于路径
+    assert.deepEqual(resolveSound({ path: wav, silent: true }), { silent: true });
+    // 不存在、目录、不支持的扩展名都回退到系统默认音效（只返回 missing 供提示）
+    assert.deepEqual(resolveSound({ path: join(dir, "missing.wav") }), { missing: join(dir, "missing.wav") });
+    assert.deepEqual(resolveSound({ path: folder }), { missing: folder });
+    assert.deepEqual(resolveSound({ path: txt }), { missing: txt });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native helper builds safe toast audio XML and falls back to the default sound", async () => {
+  assert.equal(await buildNativeHelper(), true, "csc build failed");
+  const helper = nativeHelper();
+  assert.ok(helper);
+  const dir = mkdtempSync(join(tmpdir(), "clickable-toast-xml-"));
+  try {
+    const wav = join(dir, "ding dong#1 %20.wav");
+    const txt = join(dir, "notes.txt");
+    writeFileSync(wav, "RIFF");
+    writeFileSync(txt, "x");
+    const xml = (...extra: string[]): string =>
+      execFileSync(helper, ["-Action", "toast", "-Title", "T&<", "-Message", "M", "-AppID", "Pi.AgentToast", "-DryRun", "true", ...extra], {
+        encoding: "utf8",
+      });
+
+    // 未配置：不写 <audio>，Windows 播放系统默认音效
+    assert.ok(!xml().includes("<audio"));
+    // 有效文件：空格、#、% 都被 URI 转义，且是 file:/// 形式
+    const custom = xml("-SoundPath", wav);
+    assert.match(custom, /<audio src="file:\/\/\/[^"]*ding%20dong%231%20%2520\.wav"\/>/);
+    assert.match(custom, /<text>T&amp;&lt;<\/text>/);
+    // 静音
+    assert.ok(xml("-Silent", "true").includes('<audio silent="true"/>'));
+    // 不存在、非绝对路径、不支持的扩展名：安全回退到默认音效，通知仍然生成
+    for (const bad of [join(dir, "missing.wav"), "relative.wav", txt, dir]) {
+      const fallback = xml("-SoundPath", bad);
+      assert.ok(!fallback.includes("<audio"), `unexpected audio for ${bad}`);
+      assert.ok(fallback.includes("<toast>"));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native helper capture exits 2 instead of guessing when no terminal window exists", async () => {
+  assert.equal(await buildNativeHelper(), true, "csc build failed");
+  const helper = nativeHelper();
+  assert.ok(helper);
+  let status = 0;
+  try {
+    // 不存在的进程：绝不能退回到“当前前台窗口”
+    execFileSync(helper, ["-Action", "capture", "-Value", "2147483000"], { stdio: "ignore" });
+  } catch (error) {
+    status = (error as { status?: number }).status ?? -1;
+  }
+  assert.equal(status, 2);
 });
 
 test("does not show anything without the helper or an app id", () => {
@@ -383,6 +480,61 @@ test("captures a numeric ancestor window handle", async () => {
     ["-Value", "42"],
     ["-Value", "41"],
   ]);
+});
+
+const terminalOrigin: Origin = { cwd: "C:/work/demo", project: "demo", hwnd: "42015824" };
+
+test("plain Windows Terminal click restores and focuses the captured window without touching herdr", async () => {
+  const calls: Call[] = [];
+  const run: ExecFileLike = async (file, args) => {
+    calls.push({ file, args });
+    return { stdout: "", stderr: "" };
+  };
+  const spawned: Call[] = [];
+
+  const result = await focusOrigin(terminalOrigin, run, (file, args) => { spawned.push({ file, args }); });
+
+  assert.deepEqual(result, { ok: true, method: "window" });
+  assert.equal(calls.length, 1);
+  // 只发 focus 动作，句柄取自启动时沿父进程链捕获的值，而不是点击时的活动窗口
+  assert.deepEqual(calls[0].args.slice(-4), ["-Action", "focus", "-Value", "42015824"]);
+  assert.ok(!calls.some((c) => c.file === "herdr.exe" || c.args.includes("herdr-focus")));
+  assert.equal(spawned.length, 0);
+});
+
+test("plain terminal reports a refused focus or a missing handle instead of pretending success", async () => {
+  const refused = await focusOrigin(
+    terminalOrigin,
+    async () => { throw new Error("focus failed: target=42015824 foreground=1"); },
+    () => { throw new Error("must not open a window"); },
+  );
+  assert.equal(refused.ok, false);
+  assert.match(refused.error ?? "", /focus failed/);
+
+  const calls: Call[] = [];
+  const noHandle = await focusOrigin(
+    { cwd: "C:/work/demo", project: "demo" },
+    async (file, args) => { calls.push({ file, args }); return { stdout: "", stderr: "" }; },
+    () => { throw new Error("must not open a window"); },
+  );
+  assert.equal(noHandle.ok, false);
+  assert.match(noHandle.error ?? "", /No terminal window handle/);
+  assert.equal(calls.length, 0, "no handle means no helper call and no herdr call");
+});
+
+test("herdr origin never uses the plain window path even when a stale hwnd is present", async () => {
+  const calls: Call[] = [];
+  const run: ExecFileLike = async (file, args) => {
+    calls.push({ file, args });
+    if (args.includes("herdr-focus")) return { stdout: "42015824 via=alt tab=selected", stderr: "" };
+    return { stdout: "", stderr: "" };
+  };
+
+  const result = await focusOrigin({ ...herdrOrigin, hwnd: "999" }, run, () => {});
+
+  assert.equal(result.method, "herdr");
+  assert.ok(!calls.some((c) => c.args.includes("focus") && c.args.includes("999")), "plain focus must not run for herdr");
+  assert.deepEqual(calls.find((c) => c.file === "herdr.exe"), { file: "herdr.exe", args: ["agent", "focus", "w4:p12"] });
 });
 
 test("findWinmdRefs prefers system WinMetadata and falls back to the SDK merged winmd", () => {

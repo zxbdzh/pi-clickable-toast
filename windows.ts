@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { projectIconSpec, type Origin } from "./core.ts";
+import { projectIconSpec, type ClickableSound, type Origin } from "./core.ts";
 
 export type ExecFileLike = (
   file: string,
@@ -386,6 +386,8 @@ export interface ToastAppearance {
   appID?: string;
   /** toast 正文左侧的大图。 */
   icon?: string;
+  /** 自定义通知音效；缺省让 Windows 使用系统默认音效。 */
+  sound?: ClickableSound;
 }
 
 /** 扩展自带的默认图标。 */
@@ -475,6 +477,8 @@ export class NativeToast {
     ];
     if (appearance.icon) args.push("-Icon", appearance.icon);
     if (appearance.tag) args.push("-Tag", appearance.tag);
+    if (appearance.sound?.silent) args.push("-Silent", "true");
+    else if (appearance.sound?.path) args.push("-SoundPath", appearance.sound.path);
 
     // stdin 是给辅助程序的“生命线”：pi 从不往里写，会话一结束（正常退出、/reload、崩溃、终端被关）管道就断，
     // 辅助程序据此把这条 toast 从通知中心撤掉——不然它会在那里留到过期，点了也没人接。

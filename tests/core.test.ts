@@ -175,6 +175,17 @@ test("clickable config defaults: no source line, project icon on, app name Pi, b
   assert.deepEqual(normalizeClickableConfig({ appName: "  ", icon: "" }), normalizeClickableConfig({}));
 });
 
+test("clickable sound config supports path string, silent string, object form, and ignores invalid input", () => {
+  assert.deepEqual(normalizeClickableConfig({ sound: "D:/sound.wav" }).sound, { path: "D:/sound.wav" });
+  assert.deepEqual(normalizeClickableConfig({ sound: "silent" }).sound, { silent: true });
+  assert.deepEqual(normalizeClickableConfig({ sound: "SILENT" }).sound, { silent: true });
+  assert.deepEqual(normalizeClickableConfig({ sound: { path: " D:/s.mp3 ", silent: false } }).sound, { path: "D:/s.mp3" });
+  assert.deepEqual(normalizeClickableConfig({ sound: { path: "D:/s.mp3", silent: true } }).sound, { path: "D:/s.mp3", silent: true });
+  assert.equal(normalizeClickableConfig({ sound: "   " }).sound, undefined);
+  assert.equal(normalizeClickableConfig({ sound: { path: "   " } }).sound, undefined);
+  assert.equal(normalizeClickableConfig({ sound: null }).sound, undefined);
+});
+
 test("hasPendingWakeTask asks pi-background-tasks over the event bus and only counts running tasks that wake the agent", async () => {
   // 假总线：收到 status 请求后先回一条别人的响应（必须忽略），再异步回本次请求的结果
   const bus = (tasks?: unknown[]) => {
