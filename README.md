@@ -20,10 +20,10 @@
 ## 安装
 
 ```bash
-pi install F:\github\pi-clickable-toast   # 本地路径安装，原地加载，不复制
+pi install https://github.com/zxbdzh/pi-clickable-toast
 ```
 
-`package.json` 里的 `pi.extensions` 指向 `./index.ts`。本地包按解析出的绝对路径识别，所以**不要同时**把它拷到 `%USERPROFILE%\.pi\agent\extensions\clickable-toast` —— 那样会被当成两个包各加载一次，每条通知弹两张。
+`package.json` 里的 `pi.extensions` 指向 `./index.ts`。从 GitHub 安装时 Pi 会按仓库地址识别包；不要再把同一包用本地路径或复制到 `%USERPROFILE%\.pi\agent\extensions\clickable-toast`，否则可能被当成两个包重复加载。
 
 无运行时依赖，也不需要 `npm install`：toast 和窗口定位都由 `focus.cs` 编译出的原生 exe 完成（见下）。`@earendil-works/pi-coding-agent` 只在 `peerDependencies` 里声明，由 pi 本身提供，实际用到的是类型导入。
 
